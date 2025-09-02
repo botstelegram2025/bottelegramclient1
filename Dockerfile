@@ -7,9 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=America/Sao_Paulo
 
-# Dependências de sistema + Node 20
+# Dependências de sistema + Node 20 + GIT (necessário p/ deps via git)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates gnupg gcc g++ libpq-dev && \
+    curl ca-certificates gnupg git gcc g++ libpq-dev && \
     rm -rf /var/lib/apt/lists/* && \
     update-ca-certificates
 
@@ -25,15 +25,15 @@ RUN groupadd --gid 1001 app && useradd --uid 1001 --gid app --shell /bin/bash --
 WORKDIR /app
 
 # ---------- camada de dependências (melhor cache) ----------
-# Node deps (se existirem)
+# Node deps (servidor WhatsApp)
 COPY package*.json ./
 RUN if [ -f package.json ]; then \
       if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi; \
     else \
-      echo "⚠️  package.json não encontrado; ignorando deps Node (servidor WhatsApp não iniciará)"; \
+      echo "⚠️  package.json não encontrado; ignorando deps Node (serviço WhatsApp não iniciará)"; \
     fi
 
-# Python deps (usar apenas requirements.txt, evitar pyproject -e .)
+# Python deps (use apenas requirements.txt para evitar -e . do pyproject)
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -44,8 +44,7 @@ COPY . .
 # Pastas úteis
 RUN mkdir -p /app/logs /app/sessions /app/backups && chown -R app:app /app
 
-# Garante permissão dos scripts
-# (Se você já tiver um start.sh próprio no repo, será sobrescrito abaixo)
+# Script de start que sobe WhatsApp (:3001), espera /health e inicia o bot
 RUN printf '#!/bin/bash\n\
 set -euo pipefail\n\
 echo \"🚀 Iniciando serviços (WhatsApp + Bot)\"\n\
@@ -80,10 +79,10 @@ exit ${EXIT_CODE}\n' > /app/start.sh \
  && chmod +x /app/start.sh \
  && chown app:app /app/start.sh
 
-# Porta do WhatsApp (interno) e, se quiser expor a do bot (ajuste se usa webhook)
+# Porta do WhatsApp (interno) e, se quiser, a do bot (ex.: 5000 se usar webhook)
 EXPOSE 3001 5000
 
-# Healthcheck do serviço WhatsApp
+# Healthcheck do WhatsApp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=5 \
   CMD curl -fsS http://127.0.0.1:3001/health || exit 1
 
