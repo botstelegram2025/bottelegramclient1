@@ -1,0 +1,23 @@
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
+NIXPACKS_NODE_VERSION = "20"
+
+[phases.setup]
+nixPkgs = ['python311', 'nodejs_20', 'npm']
+
+[phases.install]
+cmds = [
+    "echo '📦 Installing Python dependencies...'",
+    "pip install --no-cache-dir -r requirements.txt",
+    "echo '🔧 Cleaning npm cache and locks...'", 
+    "rm -f package-lock.json npm-debug.log* yarn-debug.log* yarn-error.log*",
+    "npm cache clean --force",
+    "echo '📦 Installing Node.js dependencies (force clean install)...'",
+    "npm install --no-package-lock --no-audit --no-fund --loglevel=error --production"
+]
+
+[phases.build]
+cmds = ["echo '✅ Build completed successfully'"]
+
+[start]
+cmd = "python launch_railway_final.py"
