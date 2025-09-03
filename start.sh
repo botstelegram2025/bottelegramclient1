@@ -3,12 +3,16 @@ set -euo pipefail
 
 echo "🚀 Iniciando serviços…"
 
-# Python deps (já devem estar instaladas no build; se insistir em instalar aqui, mantenha silencioso)
+# Variáveis úteis
+export TZ="${TZ:-America/Sao_Paulo}"
+export WHATSAPP_SERVICE_URL="${WHATSAPP_SERVICE_URL:-http://127.0.0.1:3001}"
+
+# 1) (Opcional) deps Python – idealmente já instaladas no build
 if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt || true
 fi
 
-# Node deps (já devem estar instaladas no build; fallback leve)
+# 2) deps Node do WhatsApp (fallback leve; no build é melhor)
 if [ -f /app/whatsapp/package.json ]; then
   pushd /app/whatsapp >/dev/null
   if [ -f package-lock.json ]; then
@@ -19,14 +23,14 @@ if [ -f /app/whatsapp/package.json ]; then
   popd >/dev/null
 fi
 
-# Inicia WhatsApp (ESM .mjs)
+# 3) Sobe WhatsApp ESM .mjs
 echo "📱 Iniciando WhatsApp Baileys (ESM)…"
 cd /app/whatsapp
 node whatsapp_baileys_multi.mjs &
 WHATSAPP_PID=$!
 cd /app
 
-# Espera ficar pronto
+# 4) Espera ficar pronto
 for i in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:3001/health" >/dev/null 2>&1; then
     echo "✅ WhatsApp service OK"
@@ -36,11 +40,12 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# Inicia o bot
+# 5) Sobe o bot
 echo "🤖 Iniciando Telegram bot…"
 python main.py &
 BOT_PID=$!
 
+# 6) Encerramento limpo
 cleanup() {
   echo "🛑 Finalizando…"
   kill ${BOT_PID} ${WHATSAPP_PID} 2>/dev/null || true
