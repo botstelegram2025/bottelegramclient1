@@ -1,5 +1,5 @@
 # Multi-stage build for Node.js and Python app
-FROM node:18-slim as node-base
+FROM node:20-slim as node-base
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -19,7 +19,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install Node.js dependencies
-RUN npm install --production
+RUN npm install --omit=dev
 
 # Copy Python requirements
 COPY requirements.txt ./
