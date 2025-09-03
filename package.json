@@ -1,19 +1,12 @@
 {
-  "name": "workspace",
-  "version": "1.0.0",
-  "main": "whatsapp_baileys.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "type": "module",
+  "scripts": { "start": "node whatsapp_baileys_multi.js" },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.18",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "qrcode": "^1.5.4"
+    "morgan": "^1.10.0",
+    "qrcode": "^1.5.3",
+    "pino": "^9.4.0"
   }
 }
