@@ -1,44 +1,60 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-echo "🚀 Iniciando Container..."
+echo "Iniciando servicos: WhatsApp + Telegram"
 
-# Configurações de ambiente
+# Ambiente basico
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
-export TZ="${TZ:-America/Sao_Paulo}"
+: "${TZ:=America/Sao_Paulo}"
+export TZ
+: "${PORT:=3001}"
+export PORT
 
-# Iniciar servidor WhatsApp em background
-echo "📱 Iniciando WhatsApp Service..."
-cd /app/whatsapp
-node whatsapp_baileys_multi.js &
+# Sobe o servidor WhatsApp (Baileys) em background
+echo "Subindo WhatsApp na porta ${PORT}..."
+node /app/whatsapp_baileys_multi.js &
 WA_PID=$!
-cd /app
 
-# Esperar o servidor WhatsApp ficar online
-echo "⏳ Aguardando WhatsApp Service..."
-for i in $(seq 1 30); do
-    if curl -s http://localhost:3001/health > /dev/null; then
-        echo "✅ WhatsApp Service está pronto"
-        break
-    fi
-    echo "⏳ Tentativa $i/30..."
-    sleep 2
+# Aguarda /health responder
+echo "Aguardando WhatsApp /health..."
+i=1
+while [ "$i" -le 30 ]; do
+  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    echo "WhatsApp pronto"
+    break
+  fi
+  echo "Tentativa ${i}/30"
+  i=$((i+1))
+  sleep 2
 done
 
-# Iniciar o bot principal
-echo "🤖 Iniciando Telegram Bot..."
-python3 main.py &
+# Inicia o bot Telegram
+echo "Iniciando bot Telegram..."
+python /app/main.py &
 BOT_PID=$!
 
-# Capturar sinais para encerrar com segurança
+# Encerramento limpo
 cleanup() {
-    echo "🛑 Encerrando serviços..."
-    kill $BOT_PID $WA_PID 2>/dev/null || true
-    wait
-    echo "✅ Serviços finalizados"
-    exit 0
+  echo "Encerrando processos..."
+  kill "$BOT_PID" "$WA_PID" 2>/dev/null || true
+  wait 2>/dev/null || true
 }
-trap cleanup SIGTERM SIGINT
+trap cleanup INT TERM
 
-wait $BOT_PID $WA_PID
+# Mantem o container vivo e monitora os dois processos
+while :; do
+  if ! kill -0 "$BOT_PID" 2>/dev/null; then
+    echo "Bot finalizou; encerrando WhatsApp..."
+    kill "$WA_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    exit 0
+  fi
+  if ! kill -0 "$WA_PID" 2>/dev/null; then
+    echo "WhatsApp finalizou; encerrando bot..."
+    kill "$BOT_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    exit 0
+  fi
+  sleep 5
+done
