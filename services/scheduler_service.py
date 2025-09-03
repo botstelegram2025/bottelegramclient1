@@ -287,6 +287,24 @@ class SchedulerService:
             now_time = now.time()
             today = now.date()
 
+            # helpers locais
+            def _as_date(value):
+                if not value:
+                    return None
+                return value.date() if isinstance(value, datetime) else value
+
+            def _set_run_field(settings_obj, field_name):
+                """Grava last_* como date ou datetime conforme o tipo atual do campo."""
+                cur_val = getattr(settings_obj, field_name, None)
+                try:
+                    if isinstance(cur_val, datetime):
+                        setattr(settings_obj, field_name, now)
+                    else:
+                        setattr(settings_obj, field_name, today)
+                except Exception:
+                    # fallback seguro
+                    setattr(settings_obj, field_name, today)
+
             db = DatabaseService()
             with db.get_session() as session:
                 users_settings = (
@@ -302,61 +320,68 @@ class SchedulerService:
                     # Trial/assinatura
                     self._check_trial_expiration(user, today)
 
+                    # cria defaults se não existir configuração
                     if not settings:
                         settings = UserScheduleSettings(
                             user_id=user.id,
                             morning_reminder_time="09:00",
                             daily_report_time="08:00",
                             auto_send_enabled=True,
+                            is_active=True,  # respeita seu schema
                         )
                         session.add(settings)
                         session.commit()
 
+                    # respeita flags de settings
+                    if hasattr(settings, "is_active") and settings.is_active is False:
+                        continue
                     if hasattr(settings, "auto_send_enabled") and not settings.auto_send_enabled:
                         continue
 
-                    # Parse horários
+                    # Parse horários com default se vier None/"" inválido
                     try:
-                        morning_hhmm = datetime.strptime(settings.morning_reminder_time, "%H:%M").time()
+                        morning_hhmm = datetime.strptime(settings.morning_reminder_time or "09:00", "%H:%M").time()
                     except Exception:
                         logger.warning(f"User {user.id} invalid morning_reminder_time; using 09:00")
                         morning_hhmm = datetime.strptime("09:00", "%H:%M").time()
 
                     try:
-                        report_hhmm = datetime.strptime(settings.daily_report_time, "%H:%M").time()
+                        report_hhmm = datetime.strptime(settings.daily_report_time or "08:00", "%H:%M").time()
                     except Exception:
                         logger.warning(f"User {user.id} invalid daily_report_time; using 08:00")
                         report_hhmm = datetime.strptime("08:00", "%H:%M").time()
 
+                    # Normaliza last_* para comparação por DATA
+                    last_m = _as_date(getattr(settings, "last_morning_run", None))
+                    last_r = _as_date(getattr(settings, "last_report_run", None))
+
                     # Morning reminders (catch-up)
-                    run_morning = (now_time >= morning_hhmm) and (
-                        not getattr(settings, "last_morning_run", None)
-                        or getattr(settings, "last_morning_run") != today
-                    )
+                    run_morning = (now_time >= morning_hhmm) and (last_m != today)
                     if run_morning:
                         fut = asyncio.run_coroutine_threadsafe(
                             self._process_daily_reminders_for_user(user.id), self._get_loop()
                         )
                         try:
                             fut.result(timeout=120)
-                            settings.last_morning_run = today
+                            _set_run_field(settings, "last_morning_run")
+                            if hasattr(settings, "updated_at"):
+                                settings.updated_at = now
                             session.commit()
                             logger.info(f"✅ Morning reminders executed for user {user.id}")
                         except Exception as e:
                             logger.exception(f"Error morning reminders user {user.id}: {e}")
 
                     # Daily report (catch-up)
-                    run_report = (now_time >= report_hhmm) and (
-                        not getattr(settings, "last_report_run", None)
-                        or getattr(settings, "last_report_run") != today
-                    )
+                    run_report = (now_time >= report_hhmm) and (last_r != today)
                     if run_report:
                         fut = asyncio.run_coroutine_threadsafe(
                             self._process_user_notifications_for_user(user.id), self._get_loop()
                         )
                         try:
                             fut.result(timeout=120)
-                            settings.last_report_run = today
+                            _set_run_field(settings, "last_report_run")
+                            if hasattr(settings, "updated_at"):
+                                settings.updated_at = now
                             session.commit()
                             logger.info(f"📤 Daily report sent to user {user.id}")
                         except Exception as e:
@@ -653,123 +678,4 @@ class SchedulerService:
                 user_id=user.id,
                 log_ctx={
                     "user_id": user.id,
-                    "client_id": c.id,
-                    "template_id": template.id,
-                    "template_type": reminder_type,
-                    "recipient_phone": c.phone_number,
-                    "message_content": content,
-                },
-            )
-
-    def _replace_template_variables(self, template_content, client):
-        """Replace template variables with client data"""
-        def fmt_money(v):
-            try:
-                return f"{float(v):.2f}"
-            except Exception:
-                return str(v) if v is not None else ""
-
-        variables = {
-            "{nome}": getattr(client, "name", ""),
-            "{plano}": getattr(client, "plan_name", ""),
-            "{valor}": fmt_money(getattr(client, "plan_price", 0.0)),
-            "{vencimento}": getattr(client, "due_date", None).strftime("%d/%m/%Y") if getattr(client, "due_date", None) else "",
-            "{servidor}": getattr(client, "server", "") or "Não definido",
-            "{informacoes_extras}": getattr(client, "other_info", "") or "",
-        }
-
-        result = str(template_content or "")
-        for k, v in variables.items():
-            result = result.replace(k, str(v))
-
-        # Limpeza de quebras extras
-        while "\n\n\n" in result:
-            result = result.replace("\n\n\n", "\n\n")
-        return result.strip()
-
-    # ------------- Enfileiradores públicos -------------
-
-    def enqueue_whatsapp_message(self, to: str, content: str, user_id: int, log_ctx: dict | None = None):
-        task = {
-            "type": "whatsapp",
-            "payload": {"to": to, "content": content, "user_id": user_id},
-            "meta": {"log_ctx": log_ctx or {}},
-        }
-        try:
-            self.msg_queue.put_nowait(task)
-        except queue.Full:
-            logger.error("Message queue is full; dropping WhatsApp message")
-
-    def enqueue_telegram_message(self, chat_id: str, text: str, parse_mode: str | None = None):
-        task = {
-            "type": "telegram",
-            "payload": {"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
-            "meta": {"log_ctx": None},
-        }
-        try:
-            self.msg_queue.put_nowait(task)
-        except queue.Full:
-            logger.error("Message queue is full; dropping Telegram message")
-
-    # ------------- Trial / assinatura -------------
-
-    def _check_trial_expiration(self, user, current_date):
-        """
-        Desativa usuário ao expirar o trial (7 dias) e notifica por Telegram.
-        Usa fila para envio da notificação.
-        """
-        try:
-            if not getattr(user, "is_trial", False):
-                return
-
-            trial_end = user.created_at.date() + timedelta(days=7)
-            days_left = (trial_end - current_date).days
-
-            if days_left <= 0 and getattr(user, "is_active", True):
-                # desativa
-                from services.database_service import DatabaseService
-                db = DatabaseService()
-                with db.get_session() as session:
-                    db_user = session.query(type(user)).filter_by(id=user.id).first()
-                    if db_user:
-                        db_user.is_active = False
-                        session.commit()
-
-                # notifica
-                self.enqueue_telegram_message(
-                    str(user.telegram_id),
-                    (
-                        "⚠️ **Seu período de teste expirou!**\n\n"
-                        "Seu teste gratuito de 7 dias chegou ao fim. Para continuar usando todas as funcionalidades do bot, você precisa ativar a assinatura mensal.\n\n"
-                        "💰 **Assinatura:** R$ 20,00/mês\n"
-                        "✅ **Inclui:**\n"
-                        "• Gestão ilimitada de clientes\n"
-                        "• Lembretes automáticos via WhatsApp\n"
-                        "• Controle de vencimentos\n"
-                        "• Relatórios detalhados\n"
-                        "• Suporte prioritário\n\n"
-                        "🔗 Use o comando /start para assinar e reativar sua conta!"
-                    ),
-                    parse_mode="Markdown",
-                )
-
-            elif days_left == 1:
-                self.enqueue_telegram_message(
-                    str(user.telegram_id),
-                    (
-                        f"⏰ **Lembrete: Seu teste expira em {days_left} dia!**\n\n"
-                        "💰 **Assinatura:** R$ 20,00/mês\n"
-                        "🎯 **Mantenha:**\n"
-                        "• Todos os seus clientes cadastrados\n"
-                        "• Lembretes automáticos configurados\n"
-                        "• Histórico de mensagens\n\n"
-                        "Para assinar e garantir a continuidade, use o comando /start quando seu teste expirar."
-                    ),
-                    parse_mode="Markdown",
-                )
-
-        except Exception:
-            logger.exception(f"Error checking trial expiration for user {getattr(user, 'id', '?')}")
-
-# Instância global
-scheduler_service = SchedulerService()
+                    "
