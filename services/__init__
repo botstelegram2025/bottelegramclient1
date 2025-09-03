@@ -1,0 +1,8 @@
+whatsapp_url_env = os.getenv("WHATSAPP_SERVICE_URL", "").strip()
+if whatsapp_url_env:
+    base = _normalize_base_url(whatsapp_url_env)  # agora preserva http://127.0.0.1:3001
+elif railway_environment:
+    base = "http://127.0.0.1:3001"
+else:
+    base = "http://localhost:3001"
+self.baileys_url = base
