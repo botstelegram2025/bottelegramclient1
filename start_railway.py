@@ -97,7 +97,7 @@ class RailwayServiceManager:
             time.sleep(5)
             
             # Start Telegram bot
-            cmd = ['python', 'main.py']
+            cmd = ['python3', 'main.py']
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
