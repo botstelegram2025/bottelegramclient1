@@ -1,59 +1,81 @@
-#!/bin/bash
+#!/bin/sh
+set -eu
 
-# Script de inicialização para Railway
-# Inicia ambos os serviços: Telegram Bot e WhatsApp Server
+echo "Iniciando serviços (WhatsApp + Telegram)"
 
-echo "🚀 Iniciando serviços no Railway..."
+# Ambiente
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+: "${TZ:=America/Sao_Paulo}"
+export TZ
+: "${PORT:=3001}"        # Porta do servidor WhatsApp local
+export PORT
 
-# Verificar se as dependências estão instaladas
-echo "📦 Verificando dependências Python..."
-pip install -q -r requirements.txt
+# Se não houver URL externa definida, o bot falará com o WhatsApp local
+if [ -z "${WHATSAPP_SERVICE_URL:-}" ]; then
+  export WHATSAPP_SERVICE_URL="http://127.0.0.1:${PORT}"
+fi
 
-echo "📦 Verificando dependências Node.js..."
-npm install --silent
+# (IMPORTANTE) Não instalar dependências em runtime:
+# Removidos: "pip install -r requirements.txt" e "npm install"
+# Garanta as dependências no build (Dockerfile/Nixpacks).
 
-# Iniciar o servidor WhatsApp em background
-echo "📱 Iniciando servidor WhatsApp Baileys..."
-node whatsapp_baileys_multi.js &
-WHATSAPP_PID=$!
+# --- Inicia WhatsApp (se presente) ---
+WA_PID=""
+if [ -f "/app/whatsapp_baileys_multi.js" ]; then
+  echo "Subindo WhatsApp na porta ${PORT}"
+  node /app/whatsapp_baileys_multi.js &
+  WA_PID=$!
 
-# Aguardar alguns segundos para o servidor WhatsApp inicializar
-sleep 5
+  # Aguarda /health
+  echo "Aguardando WhatsApp responder em /health"
+  i=1
+  while [ "$i" -le 30 ]; do
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      echo "WhatsApp pronto"
+      break
+    fi
+    echo "Tentativa $i de 30"
+    i=`expr "$i" + 1`
+    sleep 2
+  done
+else
+  echo "Aviso: /app/whatsapp_baileys_multi.js não encontrado; WhatsApp será ignorado"
+fi
 
-# Iniciar o bot Telegram
-echo "🤖 Iniciando bot Telegram..."
-python main.py &
-TELEGRAM_PID=$!
+# --- Inicia Telegram bot ---
+if [ -f "/app/main.py" ]; then
+  echo "Iniciando bot Telegram"
+  python /app/main.py &
+  TELEGRAM_PID=$!
+else
+  echo "ERRO: /app/main.py não encontrado"
+  # Se quiser manter o WhatsApp vivo mesmo sem o bot, comente o exit 1
+  exit 1
+fi
 
-# Função para cleanup em caso de encerramento
-cleanup() {
-    echo "🛑 Encerrando serviços..."
-    kill $WHATSAPP_PID 2>/dev/null
-    kill $TELEGRAM_PID 2>/dev/null
-    exit 0
-}
+# Trap (sem função) para desligar limpo
+trap 'echo "Encerrando..."; \
+  kill "$TELEGRAM_PID" 2>/dev/null || true; \
+  [ -n "${WA_PID}" ] && kill "$WA_PID" 2>/dev/null || true; \
+  wait 2>/dev/null || true; \
+  exit 0' INT TERM
 
-# Capturar sinais de encerramento
-trap cleanup SIGTERM SIGINT
-
-echo "✅ Ambos os serviços estão rodando"
-echo "WhatsApp Server PID: $WHATSAPP_PID"
-echo "Telegram Bot PID: $TELEGRAM_PID"
-
-# Manter o script ativo e monitorar os processos
+# Monitor/auto-restart simples
 while true; do
-    # Verificar se os processos ainda estão rodando
-    if ! kill -0 $WHATSAPP_PID 2>/dev/null; then
-        echo "⚠️ Servidor WhatsApp parou, reiniciando..."
-        node whatsapp_baileys_multi.js &
-        WHATSAPP_PID=$!
-    fi
-    
-    if ! kill -0 $TELEGRAM_PID 2>/dev/null; then
-        echo "⚠️ Bot Telegram parou, reiniciando..."
-        python main.py &
-        TELEGRAM_PID=$!
-    fi
-    
-    sleep 30
+  # Reinicia WhatsApp se cair (quando existir)
+  if [ -n "${WA_PID}" ] && ! kill -0 "$WA_PID" 2>/dev/null; then
+    echo "WhatsApp parou; reiniciando..."
+    node /app/whatsapp_baileys_multi.js &
+    WA_PID=$!
+  fi
+
+  # Reinicia bot se cair
+  if ! kill -0 "$TELEGRAM_PID" 2>/dev/null; then
+    echo "Bot Telegram parou; reiniciando..."
+    python /app/main.py &
+    TELEGRAM_PID=$!
+  fi
+
+  sleep 10
 done
