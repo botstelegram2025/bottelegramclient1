@@ -1,49 +1,56 @@
-#!/usr/bin/env sh
-set -eu
+#!/bin/bash
+set -Eeuo pipefail
 
-echo "🚀 Iniciando WhatsApp + Bot…"
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=${TZ:-America/Sao_Paulo}
 
-# Railway injeta PORT (ex.: 8080). Se não vier, usa 3001.
-PORT="${PORT:-3001}"
+WA_DIR="/app/whatsapp"
+WA_JS_NAME="whatsapp_baileys_multi.js"
 
-# WhatsApp local no mesmo container: use 127.0.0.1:$PORT
-export WHATSAPP_SERVICE_URL="http://127.0.0.1:${PORT}"
-
-echo "🩺 Verificando WhatsApp em ${WHATSAPP_SERVICE_URL}/health…"
-
-# 1) Sobe o WhatsApp server (ESM)
-if [ -f "whatsapp_baileys_multi.js" ]; then
-  echo "📱 Subindo WhatsApp server (node)…"
-  node whatsapp_baileys_multi.js &
-  WA_PID=$!
+# Detect ESM file
+if [[ -f "${WA_DIR}/${WA_JS_NAME}" ]]; then
+  WA_ENTRY="${WA_DIR}/${WA_JS_NAME}"
 else
-  echo "⚠️  whatsapp_baileys_multi.js não encontrado; seguindo sem WhatsApp local"
-  WA_PID=""
+  echo "❌ WhatsApp server entry not found"
+  exit 2
 fi
 
-# 2) Aguarda /health (até 20s)
-if [ -n "${WA_PID}" ]; then
-  i=0
-  until curl -fsS "${WHATSAPP_SERVICE_URL%/}/health" >/dev/null 2>&1; do
-    i=$((i+1))
-    [ $i -ge 20 ] && { echo "❌ WhatsApp não respondeu em /health"; break; }
-    sleep 1
-  done
+# Warn if file still CommonJS
+if grep -q "require(" "$WA_ENTRY"; then
+  echo "⚠️ $WA_ENTRY usa require(...). Node está em modo ES Module (type: module). Renomeando para .cjs temporariamente."
+  mv "$WA_ENTRY" "$WA_ENTRY.cjs"
+  WA_ENTRY="$WA_ENTRY.cjs"
 fi
 
-# 3) Inicia o bot
-echo "🤖 Iniciando bot (python)…"
-python main.py &
-BOT_PID=$!
+# Install deps only if node_modules missing (optional)
+if [[ -f "$(dirname "$WA_ENTRY")/package.json" && ! -d "$(dirname "$WA_ENTRY")/node_modules" ]]; then
+  echo "📦 Instalando deps Node..."
+  npm --prefix "$(dirname "$WA_ENTRY")" install --omit=dev
+fi
 
-# 4) Encerramento limpo
-trap 'echo "🛑 Encerrando…"; [ -n "${BOT_PID}" ] && kill "${BOT_PID}" 2>/dev/null || true; [ -n "${WA_PID}" ] && kill "${WA_PID}" 2>/dev/null || true; exit 0' INT TERM
+# Export service URL for Python bot
+export WHATSAPP_SERVICE_URL="http://127.0.0.1:3001"
 
-# 5) Monitor
-while :; do
-  alive=0
-  if [ -n "${BOT_PID}" ] && kill -0 "${BOT_PID}" 2>/dev/null; then alive=$((alive+1)); fi
-  if [ -n "${WA_PID}" ] && kill -0 "${WA_PID}" 2>/dev/null; then alive=$((alive+1)); fi
-  [ $alive -eq 0 ] && { echo "❌ Ambos pararam. Saindo."; exit 1; }
-  sleep 5
+# Start Node
+node "$WA_ENTRY" &
+WHATSAPP_PID=$!
+
+# Wait for health
+for i in {1..30}; do
+  if curl -fsS "http://127.0.0.1:3001/health" >/dev/null; then
+    echo "✅ WhatsApp service is ready"
+    break
+  fi
+  echo "⏳ Waiting WhatsApp... ($i/30)"
+  sleep 1
 done
+
+# Start Python
+python main.py &
+TELEGRAM_PID=$!
+
+# trap
+cleanup(){ kill $WHATSAPP_PID $TELEGRAM_PID 2>/dev/null || true; wait || true; }
+trap cleanup SIGINT SIGTERM
+
+wait -n $WHATSAPP_PID $TELEGRAM_PID
+exit $?
