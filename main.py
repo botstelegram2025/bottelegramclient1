@@ -24,6 +24,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Phone number utility function
+def normalize_brazilian_phone(phone_number: str) -> str:
+    """
+    Normalize Brazilian phone numbers for Baileys compatibility.
+    Removes 9th digit from mobile numbers to match old format.
+    
+    Examples:
+    - '11987654321' -> '1187654321' (removes 9th digit)
+    - '1187654321' -> '1187654321' (already correct)
+    - '11 9 8765-4321' -> '1187654321' (cleans and removes 9th)
+    """
+    if not phone_number:
+        return ''
+    
+    # Remove all non-digit characters
+    clean_phone = ''.join(filter(str.isdigit, phone_number))
+    
+    # Remove country code if present
+    if clean_phone.startswith('55'):
+        clean_phone = clean_phone[2:]
+    
+    # Handle different phone formats
+    if len(clean_phone) == 11:  # DDD + 9 + 8 digits (new format)
+        # Remove the 9th digit (3rd position after DDD)
+        ddd = clean_phone[:2]
+        remaining = clean_phone[3:]  # Skip the 9th digit
+        clean_phone = ddd + remaining
+    elif len(clean_phone) == 10:  # DDD + 8 digits (old format) - already correct
+        pass
+    elif len(clean_phone) == 9:  # 9 + 8 digits (missing DDD)
+        # Default to São Paulo (11) if no DDD provided
+        clean_phone = '11' + clean_phone[1:]  # Remove the 9 and add DDD
+    elif len(clean_phone) == 8:  # 8 digits (missing DDD and 9)
+        # Default to São Paulo (11)
+        clean_phone = '11' + clean_phone
+    
+    # Ensure we have exactly 10 digits (DDD + 8)
+    if len(clean_phone) != 10:
+        # If still not 10 digits, return original cleaned number
+        return ''.join(filter(str.isdigit, phone_number))
+    
+    return clean_phone
+
 # Import configurations and services
 from config import Config
 from services.database_service import db_service
@@ -307,14 +350,16 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     phone_number = update.message.text or ""
     
-    # Validate phone number
-    clean_phone = ''.join(filter(str.isdigit, phone_number))
-    if len(clean_phone) < 10 or len(clean_phone) > 11:
+    # Validate and normalize phone number
+    normalized_phone = normalize_brazilian_phone(phone_number)
+    if len(normalized_phone) != 10:
         await update.message.reply_text(
             "❌ Número inválido. Digite apenas números com DDD.\n**Exemplo:** 11999999999",
             parse_mode='Markdown'
         )
         return WAITING_FOR_PHONE
+    
+    clean_phone = normalized_phone
     
     try:
         with db_service.get_session() as session:
@@ -836,15 +881,17 @@ async def handle_client_phone(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(update, context)
         return ConversationHandler.END
     
-    # Validate phone number
-    clean_phone = ''.join(filter(str.isdigit, phone_number))
-    if len(clean_phone) < 10 or len(clean_phone) > 11:
+    # Validate and normalize phone number
+    normalized_phone = normalize_brazilian_phone(phone_number)
+    if len(normalized_phone) != 10:
         await update.message.reply_text(
             "❌ Número inválido. Digite apenas números com DDD.\n**Exemplo:** 11999999999",
             reply_markup=get_add_client_phone_keyboard(),
             parse_mode='Markdown'
         )
         return WAITING_CLIENT_PHONE
+    
+    clean_phone = normalized_phone
     
     # Store phone in context
     context.user_data['client_phone'] = clean_phone
@@ -4976,6 +5023,7 @@ def main():
         application.add_handler(CallbackQueryHandler(schedule_settings_callback, pattern="^schedule_settings$"))
         application.add_handler(CallbackQueryHandler(toggle_auto_send_on_callback, pattern="^toggle_auto_send_on$"))
         application.add_handler(CallbackQueryHandler(toggle_auto_send_off_callback, pattern="^toggle_auto_send_off$"))
+        application.add_handler(CallbackQueryHandler(manual_sync_callback, pattern="^manual_sync_queue$"))
         application.add_handler(CallbackQueryHandler(toggle_client_reminders_callback, pattern="^toggle_reminders_\\d+$"))
         
         # Client management callbacks
@@ -5353,6 +5401,7 @@ async def schedule_settings_callback(update: Update, context: ContextTypes.DEFAU
                 [InlineKeyboardButton("🌅 Alterar Horário Matinal", callback_data="set_morning_time")],
                 [InlineKeyboardButton("📊 Alterar Horário Relatório", callback_data="set_report_time")],
                 [InlineKeyboardButton(auto_send_button_text, callback_data=auto_send_callback)],
+                [InlineKeyboardButton("🔄 Sincronizar Fila", callback_data="manual_sync_queue")],
                 [InlineKeyboardButton("🔄 Resetar para Padrão", callback_data="reset_schedule")],
                 [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
             ]
@@ -5371,6 +5420,214 @@ async def toggle_auto_send_on_callback(update: Update, context: ContextTypes.DEF
 async def toggle_auto_send_off_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle auto send OFF"""
     await toggle_auto_send(update, context, False)
+
+async def manual_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle manual queue sync button - Sync sending queue manually"""
+    if not update.callback_query:
+        return
+        
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    try:
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user or not db_user.is_active:
+                await query.edit_message_text("❌ Conta inativa.")
+                return
+            
+            # Show processing message
+            await query.edit_message_text(
+                "🔄 **Sincronizando fila de envio...**\n\n⏳ Por favor aguarde, processando todos os clientes...",
+                parse_mode='Markdown'
+            )
+            
+            # Execute manual sync
+            sync_result = await manual_sync_queue(db_user.id)
+            
+            # Show results
+            if sync_result['success']:
+                text = f"""✅ **Sincronização Concluída!**
+
+📊 **Resultados:**
+• 🔍 Clientes verificados: {sync_result['clients_checked']}
+• 📤 Mensagens na fila: {sync_result['messages_queued']}
+• ⏰ Próximo envio: {sync_result['next_send_time']}
+
+🎯 **A fila foi atualizada com sucesso!**
+
+Todos os lembretes serão enviados nos horários configurados."""
+            else:
+                text = f"""⚠️ **Sincronização com Problemas**
+
+❌ **Erro:** {sync_result['error']}
+
+💡 **Sugestões:**
+• Verifique sua conexão WhatsApp
+• Tente novamente em alguns minutos
+• Contate o suporte se persistir"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Sincronizar Novamente", callback_data="manual_sync_queue")],
+                [InlineKeyboardButton("⏰ Voltar aos Horários", callback_data="schedule_settings")],
+                [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+    except Exception as e:
+        logger.error(f"Error in manual sync callback: {e}")
+        await query.edit_message_text(
+            "❌ Erro ao executar sincronização manual.\n\nTente novamente em alguns momentos."
+        )
+
+async def manual_sync_queue(user_id: int):
+    """Execute manual sync for user's queue"""
+    try:
+        from services.database_service import DatabaseService
+        from services.whatsapp_service import whatsapp_service
+        from models import Client, MessageTemplate, MessageLog
+        from datetime import date, timedelta
+        import asyncio
+        
+        db_service = DatabaseService()
+        result = {
+            'success': False,
+            'clients_checked': 0,
+            'messages_queued': 0,
+            'next_send_time': 'Não definido',
+            'error': None
+        }
+        
+        with db_service.get_session() as session:
+            user = session.query(User).filter_by(id=user_id, is_active=True).first()
+            
+            if not user:
+                result['error'] = 'Usuário não encontrado ou inativo'
+                return result
+            
+            today = date.today()
+            
+            # Get clients that need reminders using optimized query
+            from sqlalchemy import or_
+            clients_needing_reminders = session.query(Client).filter(
+                Client.user_id == user.id,
+                Client.status == 'active',
+                Client.auto_reminders_enabled == True,
+                or_(
+                    Client.due_date == today + timedelta(days=2),  # 2 days
+                    Client.due_date == today + timedelta(days=1),  # 1 day
+                    Client.due_date == today,                      # today
+                    Client.due_date == today - timedelta(days=1)   # overdue
+                )
+            ).all()
+            
+            result['clients_checked'] = len(clients_needing_reminders)
+            
+            if not clients_needing_reminders:
+                result['success'] = True
+                result['next_send_time'] = 'Nenhum lembrete pendente hoje'
+                return result
+            
+            # Process each client with timeout control
+            messages_queued = 0
+            
+            for client in clients_needing_reminders:
+                try:
+                    # Determine reminder type
+                    days_until_due = (client.due_date - today).days
+                    
+                    if days_until_due == 2:
+                        reminder_type = 'reminder_2_days'
+                    elif days_until_due == 1:
+                        reminder_type = 'reminder_1_day'
+                    elif days_until_due == 0:
+                        reminder_type = 'reminder_due_date'
+                    elif days_until_due == -1:
+                        reminder_type = 'reminder_overdue'
+                    else:
+                        continue  # Skip if not in range
+                    
+                    # Get template for this reminder type
+                    template = session.query(MessageTemplate).filter_by(
+                        user_id=user.id,
+                        template_type=reminder_type,
+                        is_active=True
+                    ).first()
+                    
+                    if not template:
+                        continue  # Skip if no template
+                    
+                    # Process template with client data
+                    message_content = template.content
+                    message_content = message_content.replace('{cliente}', client.name or 'Cliente')
+                    message_content = message_content.replace('{servico}', client.service_description or 'Serviço')
+                    message_content = message_content.replace('{valor}', f'R$ {client.monthly_value:.2f}' if client.monthly_value else 'R$ 0,00')
+                    message_content = message_content.replace('{vencimento}', client.due_date.strftime('%d/%m/%Y') if client.due_date else 'Não definido')
+                    
+                    # Send message with timeout
+                    result_send = await asyncio.wait_for(
+                        whatsapp_service.send_message(user.id, client.phone_number, message_content),
+                        timeout=5
+                    )
+                    
+                    # Log the message
+                    status = 'sent' if result_send.get('success') else 'failed'
+                    error_msg = result_send.get('error') if not result_send.get('success') else None
+                    
+                    message_log = MessageLog(
+                        user_id=user.id,
+                        client_id=client.id,
+                        template_type=reminder_type,
+                        recipient_phone=client.phone_number,
+                        message_content=message_content,
+                        sent_at=datetime.now(),
+                        status=status,
+                        error_message=error_msg
+                    )
+                    session.add(message_log)
+                    
+                    if result_send.get('success'):
+                        messages_queued += 1
+                        
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout sending message to client {client.id} during manual sync")
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing client {client.id} in manual sync: {e}")
+                    continue
+            
+            session.commit()
+            
+            result['success'] = True
+            result['messages_queued'] = messages_queued
+            
+            # Get user's schedule settings for next send time
+            from models import UserScheduleSettings
+            schedule_settings = session.query(UserScheduleSettings).filter_by(
+                user_id=user.id
+            ).first()
+            
+            if schedule_settings:
+                result['next_send_time'] = f"Próximo: {schedule_settings.morning_reminder_time} (amanhã)"
+            else:
+                result['next_send_time'] = "Próximo: 09:00 (amanhã)"
+                
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in manual sync queue: {e}")
+        return {
+            'success': False,
+            'clients_checked': 0,
+            'messages_queued': 0,
+            'next_send_time': 'Erro',
+            'error': str(e)
+        }
 
 async def toggle_auto_send(update: Update, context: ContextTypes.DEFAULT_TYPE, enable: bool):
     """Toggle automatic sending on or off"""

@@ -94,11 +94,16 @@ ADMIN_USER_ID=seu_telegram_user_id_para_admin
 ```toml
 [build]
 builder = "nixpacks"
+nixpacksConfigPath = "nixpacks.toml"
 
 [deploy]  
 startCommand = "python start_railway.py"
 restartPolicyType = "always"
 restartPolicyMaxRetries = 5
+
+[env]
+NODE_ENV = "production"
+PYTHONUNBUFFERED = "1"
 ```
 
 ### **Procfile**

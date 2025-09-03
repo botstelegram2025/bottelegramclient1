@@ -1,0 +1,52 @@
+# Railway ignore file - exclude files from deployment
+
+# Development files
+*.log
+.env
+.env.local
+.replit
+replit.nix
+
+# Sessions and auth data (will be recreated)
+sessions/
+auth_info_baileys*/
+backup_auth_info_baileys*
+
+# Cache and temporary files
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+node_modules/.cache/
+*.tmp
+*.temp
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git files
+.git/
+.gitignore
+
+# Documentation (optional)
+README.md
+RAILWAY_DEPLOY.md
+
+# Test files
+tests/
+test_*
+*_test.py
+
+# Backup files
+*.bak
+*.backup

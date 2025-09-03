@@ -4,6 +4,43 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+def normalize_brazilian_phone(phone_number: str) -> str:
+    """
+    Normalize Brazilian phone numbers for Baileys compatibility.
+    Removes 9th digit from mobile numbers to match old format.
+    """
+    if not phone_number:
+        return ''
+    
+    # Remove all non-digit characters
+    clean_phone = ''.join(filter(str.isdigit, phone_number))
+    
+    # Remove country code if present
+    if clean_phone.startswith('55'):
+        clean_phone = clean_phone[2:]
+    
+    # Handle different phone formats
+    if len(clean_phone) == 11:  # DDD + 9 + 8 digits (new format)
+        # Remove the 9th digit (3rd position after DDD)
+        ddd = clean_phone[:2]
+        remaining = clean_phone[3:]  # Skip the 9th digit
+        clean_phone = ddd + remaining
+    elif len(clean_phone) == 10:  # DDD + 8 digits (old format) - already correct
+        pass
+    elif len(clean_phone) == 9:  # 9 + 8 digits (missing DDD)
+        # Default to São Paulo (11) if no DDD provided
+        clean_phone = '11' + clean_phone[1:]  # Remove the 9 and add DDD
+    elif len(clean_phone) == 8:  # 8 digits (missing DDD and 9)
+        # Default to São Paulo (11)
+        clean_phone = '11' + clean_phone
+    
+    # Ensure we have exactly 10 digits (DDD + 8)
+    if len(clean_phone) != 10:
+        # If still not 10 digits, return original cleaned number
+        return ''.join(filter(str.isdigit, phone_number))
+    
+    return clean_phone
+
 class WhatsAppService:
     def __init__(self):
         # Support Railway environment with internal service communication
@@ -33,8 +70,9 @@ class WhatsAppService:
         Send WhatsApp message via Baileys with auto-recovery
         """
         try:
-            # Format phone number (remove non-digits and ensure country code)
-            clean_phone = ''.join(filter(str.isdigit, phone_number))
+            # Normalize phone number for Baileys compatibility
+            clean_phone = normalize_brazilian_phone(phone_number)
+            # Add country code if not present
             if not clean_phone.startswith('55'):
                 clean_phone = '55' + clean_phone
             
