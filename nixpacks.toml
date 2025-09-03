@@ -1,23 +1,23 @@
 [variables]
 NIXPACKS_PYTHON_VERSION = "3.11"
 NIXPACKS_NODE_VERSION = "20"
+RAILWAY_ENVIRONMENT_NAME = "production"
+WHATSAPP_SERVICE_URL = "http://127.0.0.1:3001"
+NODE_ENV = "production"
+PYTHONUNBUFFERED = "1"
 
 [phases.setup]
-nixPkgs = ['python311', 'nodejs_20', 'npm']
+dependsOn = ["install"]
 
 [phases.install]
 cmds = [
-    "echo '📦 Installing Python dependencies...'",
-    "pip install --no-cache-dir -r requirements.txt",
-    "echo '🔧 Cleaning npm cache and locks...'", 
-    "rm -f package-lock.json npm-debug.log* yarn-debug.log* yarn-error.log*",
-    "npm cache clean --force",
-    "echo '📦 Installing Node.js dependencies (force clean install)...'",
-    "npm install --no-package-lock --no-audit --no-fund --loglevel=error --production"
+    "apt-get update && apt-get install -y curl",
+    "pip install .",
+    "npm install"
 ]
 
 [phases.build]
-cmds = ["echo '✅ Build completed successfully'"]
+cmds = ["echo 'Build completed'"]
 
 [start]
-cmd = "python launch_railway_final.py"
+cmd = "python start_railway.py"

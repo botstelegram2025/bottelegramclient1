@@ -10,21 +10,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Environment detection
+// Railway environment detection
 const isRailway = process.env.RAILWAY_ENVIRONMENT_NAME !== undefined;
-const isLocal = !isRailway;
-
-// UNIFIED PORT CONFIGURATION - Solves Railway/Local conflict
-const UNIFIED_PORT = parseInt(process.env.PORT) || (isLocal ? 3001 : 8080);
-
 console.log(`🌍 Environment: ${isRailway ? 'Railway' : 'Local'}`);
-console.log(`🎯 UNIFIED PORT: ${UNIFIED_PORT}`);
 
 if (isRailway) {
-    console.log('⚡ Railway environment - optimized for cloud deployment');
-    console.log('🔗 Port will bind to Railway dynamic port for external access');
-} else {
-    console.log('💻 Local environment - using standard port 3001');
+    console.log('⚡ Railway environment detected - optimizing for cloud deployment');
 }
 
 // Map para armazenar sessões de cada usuário
@@ -83,299 +74,562 @@ class UserWhatsAppSession {
         await connectionSemaphore.acquire();
         
         try {
-            console.log(`🚀 Starting WhatsApp session for user ${this.userId}`);
+            console.log(`🔄 Starting connection for user ${this.userId}, forceNew: ${forceNew}`);
             
-            // Random delay to prevent simultaneous connections
-            const delay = Math.random() * 2000 + 1000; // 1-3 seconds
-            await new Promise(resolve => setTimeout(resolve, delay));
-            
-            if (this.sock && this.isConnected && !forceNew) {
-                console.log(`✅ User ${this.userId} already connected`);
-                return;
-            }
-            
-            // Clear existing connection if forcing new
-            if (forceNew && this.sock) {
-                try {
-                    await this.sock.end();
-                } catch (error) {
-                    console.log(`Warning: Error ending existing connection for user ${this.userId}:`, error.message);
-                }
-                this.sock = null;
-                this.isConnected = false;
-            }
-            
-            // Clear any existing timeout
             if (this.reconnectTimeout) {
                 clearTimeout(this.reconnectTimeout);
-                this.reconnectTimeout = null;
             }
             
-            const authPath = path.join(__dirname, 'sessions', this.authFolder);
+            // Force clean start to always generate QR when requested
+            if (forceNew) {
+                // Backup existing session before cleaning
+                const authPath = path.join(__dirname, 'sessions', this.authFolder);
+                if (fs.existsSync(authPath)) {
+                    const backupPath = path.join(__dirname, 'sessions', `backup_${this.authFolder}_${Date.now()}`);
+                    try {
+                        fs.cpSync(authPath, backupPath, { recursive: true });
+                        console.log(`💾 Backup created for user ${this.userId} at ${backupPath}`);
+                    } catch (e) {
+                        console.log(`⚠️ Could not create backup for user ${this.userId}: ${e.message}`);
+                    }
+                    
+                    fs.rmSync(authPath, { recursive: true, force: true });
+                    console.log(`🧹 Cleaned auth for user ${this.userId} - will generate new QR`);
+                }
+                this.qrCodeData = null;
+                this.connectionState = 'generating_qr';
+            }
             
-            // Create sessions directory if it doesn't exist
+            // Ensure sessions directory exists
             const sessionsDir = path.join(__dirname, 'sessions');
             if (!fs.existsSync(sessionsDir)) {
                 fs.mkdirSync(sessionsDir, { recursive: true });
             }
             
-            // Setup auth state
-            const { state, saveCreds } = await useMultiFileAuthState(authPath);
+            const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'sessions', this.authFolder));
             
-            const sock = makeWASocket({
+            this.sock = makeWASocket({
                 auth: state,
-                browser: [`Baileys-${this.userId}`, 'Chrome', '91.0'],
-                connectTimeoutMs: 60000,
-                defaultQueryTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000,
-                logger: {
-                    level: 'silent', // Reduce log noise
-                    log: () => {} // Disable logs
-                },
-                shouldIgnoreJid: jid => isJidBroadcast(jid),
-                markOnlineOnConnect: false,
                 printQRInTerminal: false,
-                // Add session-specific identifier
-                generateHighQualityLinkPreview: false,
+                defaultQueryTimeoutMs: 180000, // Railway optimized timeout
+                connectTimeoutMs: 180000, // Railway needs longer timeout
+                browser: [`User_${this.userId}`, 'Chrome', '22.04.4'], // Unique browser per user
                 syncFullHistory: false,
+                markOnlineOnConnect: true, // Keep connection visible
+                generateHighQualityLinkPreview: false,
+                retryRequestDelayMs: 5000, // Railway optimized retry delay
+                maxMsgRetryCount: 5, // More retries
                 shouldSyncHistoryMessage: () => false,
-                retryRequestDelayMs: 250,
-                qrTimeout: 30000,
-                version: [2, 2413, 1],
-                syncFullHistory: false
+                keepAliveIntervalMs: 30000, // More frequent keepalive
+                emitOwnEvents: false,
+                msgRetryCounterCache: new Map(),
+                shouldIgnoreJid: () => false,
+                // Enhanced connection stability options
+                qrTimeout: 180000, // Railway extended QR timeout
+                connectCooldownMs: 8000, // Railway longer cooldown
+                userDevicesCache: new Map(),
+                transactionOpts: {
+                    maxCommitRetries: 5, // More retries
+                    delayBetweenTriesMs: 2000 // Longer delay
+                },
             });
-            
-            this.sock = sock;
-            this.connectionState = 'connecting';
-            
-            // Handle connection updates
-            sock.ev.on('connection.update', async (update) => {
-                const { connection, lastDisconnect, qr } = update;
+
+            this.sock.ev.on('connection.update', async (update) => {
+                const { connection, lastDisconnect, qr, isNewLogin } = update;
                 
                 if (qr) {
+                    console.log(`✅ QR Code gerado para usuário ${this.userId}`);
+                    this.qrCodeData = await QRCode.toDataURL(qr);
+                    this.connectionState = 'qr_generated';
+                }
+                
+                // Generate pairing code if it's a new login
+                if (isNewLogin && !this.pairingCode && this.phoneNumber) {
                     try {
-                        console.log(`📱 QR Code gerado para usuário ${this.userId}`);
-                        this.qrCodeData = await QRCode.toDataURL(qr);
-                        this.connectionState = 'qr_ready';
+                        const code = await this.sock.requestPairingCode(this.phoneNumber);
+                        this.pairingCode = code;
+                        this.connectionState = 'pairing_code_generated';
+                        console.log(`🔐 Pairing Code gerado para usuário ${this.userId} (${this.phoneNumber}): ${code}`);
                     } catch (error) {
-                        console.error(`Erro gerando QR para usuário ${this.userId}:`, error);
-                        this.qrCodeData = null;
+                        console.log(`⚠️ Could not generate pairing code for user ${this.userId}:`, error.message);
                     }
                 }
                 
                 if (connection === 'close') {
-                    const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-                    console.log(`🔌 Conexão fechada para usuário ${this.userId}, reconectando:`, shouldReconnect);
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
+                    
+                    // Enhanced reconnection logic with specific error handling
+                    const shouldReconnect = ![
+                        DisconnectReason.loggedOut,
+                        DisconnectReason.badSession,
+                        DisconnectReason.multideviceMismatch
+                    ].includes(statusCode);
+                    
+                    console.log(`❌ Conexão fechada para usuário ${this.userId}, status: ${statusCode}, erro: "${errorMessage}", reconectando: ${shouldReconnect}`);
                     
                     this.isConnected = false;
                     this.connectionState = 'disconnected';
                     
-                    if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
-                        this.reconnectAttempts++;
-                        this.scheduleReconnect();
-                    } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-                        console.log(`❌ Max reconnect attempts reached for user ${this.userId}`);
-                        this.connectionState = 'failed';
+                    // Preserve QR data for longer to avoid unnecessary regeneration
+                    if (statusCode !== 408 && statusCode !== 428) {
+                        this.qrCodeData = null;
                     }
+                    
+                    // Enhanced error handling with specific recovery strategies
+                    if (statusCode === 515 || errorMessage.includes('stream errored')) {
+                        // Stream error - gradual reconnection
+                        console.log(`🔄 Stream error for user ${this.userId}, attempting gentle reconnection...`);
+                        this.reconnectTimeout = setTimeout(() => this.start(false), 8000);
+                    } else if (statusCode === 408) {
+                        // QR timeout - preserve session and retry
+                        console.log(`⏰ QR timeout for user ${this.userId}, preserving session...`);
+                        this.reconnectTimeout = setTimeout(() => this.start(false), 3000);
+                    } else if (statusCode === 428 || errorMessage.includes('Connection Terminated')) {
+                        // Connection terminated by server - wait before retry
+                        console.log(`🛑 Connection terminated by server for user ${this.userId}, waiting before retry...`);
+                        this.reconnectTimeout = setTimeout(() => this.start(false), 10000);
+                    } else if (statusCode === 401) {
+                        // Unauthorized - ALWAYS force new QR for auth errors
+                        console.log(`🔐 Auth error 401 for user ${this.userId}, forcing clean QR generation...`);
+                        // Clean corrupted session
+                        try {
+                            if (fs.existsSync(this.authPath)) {
+                                fs.unlinkSync(this.authPath);
+                                console.log(`🗑️ Removed corrupted session file for user ${this.userId}`);
+                            }
+                        } catch (cleanError) {
+                            console.log(`⚠️ Error removing session file: ${cleanError.message}`);
+                        }
+                        this.reconnectTimeout = setTimeout(() => this.start(true), 2000);
+                    } else if (statusCode === 440) {
+                        // Conflict error - wait longer to avoid conflicts
+                        console.log(`⚡ Conflict error for user ${this.userId}, backing off...`);
+                        this.reconnectTimeout = setTimeout(() => this.start(false), 15000);
+                    } else if (shouldReconnect) {
+                        // Normal reconnection with progressive backoff
+                        const delay = Math.min(5000 + (Math.random() * 5000), 20000); // 5-10s with max 20s
+                        console.log(`🔄 Auto-reconnecting user ${this.userId} in ${delay}ms...`);
+                        this.reconnectTimeout = setTimeout(() => this.start(false), delay);
+                    } else {
+                        console.log(`❌ User ${this.userId} requires manual reconnection`);
+                    }
+                } else if (connection === 'connecting') {
+                    console.log(`🔄 WhatsApp conectando para usuário ${this.userId}...`);
+                    this.connectionState = 'connecting';
                 } else if (connection === 'open') {
-                    console.log(`✅ WhatsApp conectado para usuário ${this.userId}`);
+                    console.log(`✅ WhatsApp conectado com sucesso para usuário ${this.userId}!`);
                     this.isConnected = true;
                     this.connectionState = 'connected';
-                    this.reconnectAttempts = 0;
-                    this.qrCodeData = null; // Clear QR code when connected
+                    this.qrCodeData = null;
                     this.pairingCode = null; // Clear pairing code when connected
-                }
-            });
-            
-            // Handle credentials update
-            sock.ev.on('creds.update', saveCreds);
-            
-            // Handle pairing code
-            sock.ev.on('creds.update', async () => {
-                if (this.phoneNumber && sock.authState.creds.registered === false) {
-                    try {
-                        const code = await sock.requestPairingCode(this.phoneNumber);
-                        this.pairingCode = code;
-                        console.log(`📱 Pairing code for user ${this.userId}: ${code}`);
-                        this.connectionState = 'pairing_code_ready';
-                    } catch (error) {
-                        console.error(`Error generating pairing code for user ${this.userId}:`, error);
+                    this.reconnectAttempts = 0; // Reset reconnect attempts
+                    
+                    // Clear any reconnection timeouts
+                    if (this.reconnectTimeout) {
+                        clearTimeout(this.reconnectTimeout);
+                        this.reconnectTimeout = null;
                     }
+                    
+                    // Start heartbeat to maintain connection
+                    this.startHeartbeat();
                 }
             });
-            
-            // Start heartbeat
-            this.startHeartbeat();
+
+            this.sock.ev.on('creds.update', saveCreds);
             
         } catch (error) {
-            console.error(`❌ Erro ao iniciar sessão para usuário ${this.userId}:`, error);
+            console.error(`❌ Erro ao iniciar WhatsApp para usuário ${this.userId}:`, error);
             this.connectionState = 'error';
-            this.scheduleReconnect();
         } finally {
-            // Release semaphore
+            // Always release semaphore
             connectionSemaphore.release();
         }
     }
     
-    scheduleReconnect() {
-        if (this.reconnectTimeout) return;
-        
-        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 60000); // Exponential backoff, max 60s
-        console.log(`⏰ Agendando reconexão para usuário ${this.userId} em ${delay/1000}s`);
-        
-        this.reconnectTimeout = setTimeout(() => {
-            this.reconnectTimeout = null;
-            this.start();
-        }, delay);
-    }
-    
-    startHeartbeat() {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-        }
-        
-        this.heartbeatInterval = setInterval(() => {
-            if (this.isConnected && this.sock) {
-                // Send heartbeat ping
-                this.sock.sendPresenceUpdate('available').catch(() => {
-                    // Ignore heartbeat errors
-                });
-            }
-        }, 30000); // Every 30 seconds
-    }
-    
     async sendMessage(number, message) {
-        if (!this.isConnected || !this.sock) {
-            throw new Error(`WhatsApp não conectado para usuário ${this.userId}`);
+        // If socket doesn't exist, definitely can't send
+        if (!this.sock) {
+            throw new Error('WhatsApp não conectado para este usuário');
         }
+        
+        // If we think we're disconnected but socket exists, try to send anyway
+        if (!this.isConnected) {
+            console.log(`⚠️ User ${this.userId} marked as disconnected but attempting to send anyway...`);
+        }
+        
+        // Formatar número para WhatsApp
+        let formattedNumber = number.replace(/\D/g, '');
+        if (!formattedNumber.startsWith('55')) {
+            formattedNumber = '55' + formattedNumber;
+        }
+        formattedNumber += '@s.whatsapp.net';
         
         try {
-            const jid = `${number}@s.whatsapp.net`;
-            const result = await this.sock.sendMessage(jid, { text: message });
-            console.log(`✅ Mensagem enviada com sucesso para ${number} pelo usuário ${this.userId}`);
+            const result = await this.sock.sendMessage(formattedNumber, { text: message });
+            console.log(`📤 Mensagem enviada pelo usuário ${this.userId} para ${number}: ${message}`);
+            
+            // If send was successful but we thought we were disconnected, update status
+            if (!this.isConnected) {
+                console.log(`✅ Message sent successfully for user ${this.userId}, updating connection status`);
+                this.isConnected = true;
+                this.connectionState = 'connected';
+            }
+            
             return result;
         } catch (error) {
-            console.error(`❌ Erro ao enviar mensagem para ${number} pelo usuário ${this.userId}:`, error);
-            throw error;
-        }
-    }
-    
-    getStatus() {
-        return {
-            userId: this.userId,
-            isConnected: this.isConnected,
-            connectionState: this.connectionState,
-            hasQR: !!this.qrCodeData,
-            hasPairingCode: !!this.pairingCode,
-            reconnectAttempts: this.reconnectAttempts
-        };
-    }
-    
-    async generateQRCode() {
-        if (this.qrCodeData) {
-            return this.qrCodeData;
-        }
-        return null;
-    }
-    
-    async generatePairingCode(phoneNumber) {
-        try {
-            this.phoneNumber = phoneNumber.replace(/\D/g, ''); // Store clean phone number
+            console.log(`❌ Erro ao enviar mensagem para usuário ${this.userId}:`, error.message);
             
-            if (this.sock && this.sock.authState.creds.registered === false) {
-                const code = await this.sock.requestPairingCode(this.phoneNumber);
-                this.pairingCode = code;
-                this.connectionState = 'pairing_code_ready';
-                console.log(`📱 Generated pairing code for user ${this.userId}: ${code}`);
-                return code;
-            } else {
-                // Start new session to generate pairing code
-                await this.start(true);
-                // Wait a bit for the session to initialize
-                await new Promise(resolve => setTimeout(resolve, 2000));
+            // If connection is closed, mark as disconnected
+            if (error.message.includes('Connection Closed') || error.message.includes('closed') || error.message.includes('ECONNRESET')) {
+                console.log(`🔄 Connection lost during message send for user ${this.userId}, marking as disconnected...`);
+                this.isConnected = false;
+                this.connectionState = 'disconnected';
                 
-                if (this.sock && this.sock.authState.creds.registered === false) {
-                    const code = await this.sock.requestPairingCode(this.phoneNumber);
-                    this.pairingCode = code;
-                    this.connectionState = 'pairing_code_ready';
-                    console.log(`📱 Generated pairing code for user ${this.userId}: ${code}`);
-                    return code;
-                } else {
-                    throw new Error('Unable to generate pairing code - session may already be registered');
+                // Clear heartbeat to avoid conflicts
+                if (this.heartbeatInterval) {
+                    clearInterval(this.heartbeatInterval);
+                    this.heartbeatInterval = null;
                 }
+                
+                // Try to reconnect automatically
+                console.log(`🔄 Attempting automatic reconnection for user ${this.userId}...`);
+                setTimeout(async () => {
+                    try {
+                        await this.start(false); // Try to reconnect without new QR
+                        console.log(`✅ Auto-reconnection successful for user ${this.userId}`);
+                    } catch (reconnectError) {
+                        console.log(`❌ Auto-reconnection failed for user ${this.userId}: ${reconnectError.message}`);
+                    }
+                }, 3000); // Wait 3 seconds before reconnecting
             }
-        } catch (error) {
-            console.error(`Error generating pairing code for user ${this.userId}:`, error);
+            
+            // Re-throw the error so the caller knows it failed
             throw error;
         }
     }
     
     async disconnect() {
-        try {
-            if (this.heartbeatInterval) {
-                clearInterval(this.heartbeatInterval);
-                this.heartbeatInterval = null;
+        // Clear all timers
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+        
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
+        
+        if (this.sock) {
+            await this.sock.logout();
+        }
+        
+        this.isConnected = false;
+        this.connectionState = 'disconnected';
+        this.qrCodeData = null;
+        this.pairingCode = null;
+        this.sock = null;
+    }
+    
+    startHeartbeat() {
+        // Clear any existing heartbeat
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+        }
+        
+        // Track consecutive heartbeat failures
+        this.heartbeatFailures = this.heartbeatFailures || 0;
+        
+        // Send a heartbeat every 90 seconds to maintain connection
+        this.heartbeatInterval = setInterval(async () => {
+            if (this.isConnected && this.sock) {
+                try {
+                    // Simple ping to keep connection alive
+                    console.log(`💓 Heartbeat for user ${this.userId} (failures: ${this.heartbeatFailures})`);
+                    
+                    await Promise.race([
+                        this.sock.query({
+                            tag: 'iq',
+                            attrs: {
+                                type: 'get',
+                                xmlns: 'w:profile:picture'
+                            }
+                        }),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('Heartbeat timeout')), 15000)
+                        )
+                    ]);
+                    
+                    // Heartbeat success - reset failure count
+                    this.heartbeatFailures = 0;
+                    
+                } catch (error) {
+                    this.heartbeatFailures++;
+                    console.log(`💔 Heartbeat failed for user ${this.userId} (${this.heartbeatFailures}/3): ${error.message}`);
+                    
+                    // Only disconnect after 3 consecutive failures
+                    if (this.heartbeatFailures >= 3) {
+                        console.log(`❌ Too many heartbeat failures for user ${this.userId}, marking as disconnected`);
+                        
+                        // Mark connection as failed
+                        this.isConnected = false;
+                        this.connectionState = 'disconnected';
+                        
+                        // Clear heartbeat to avoid conflicts
+                        if (this.heartbeatInterval) {
+                            clearInterval(this.heartbeatInterval);
+                            this.heartbeatInterval = null;
+                        }
+                        
+                        // Reset failure count
+                        this.heartbeatFailures = 0;
+                        
+                        // Only auto-reconnect for serious connection errors
+                        if (error.message.includes('Connection Closed') || error.message.includes('closed')) {
+                            console.log(`🔄 Connection lost for user ${this.userId}, initiating auto-reconnect...`);
+                            setTimeout(async () => {
+                                try {
+                                    console.log(`🔄 Auto-reconnecting user ${this.userId} after connection loss...`);
+                                    await this.start(false); // Reconnect without forcing new QR
+                                } catch (reconnectError) {
+                                    console.log(`❌ Auto-reconnect failed for user ${this.userId}:`, reconnectError.message);
+                                }
+                            }, 10000); // Wait 10 seconds before reconnecting
+                        }
+                    }
+                }
             }
+        }, 90000); // Every 90 seconds
+    }
+    
+    async reconnect() {
+        await this.disconnect();
+        
+        // ALWAYS force new QR on reconnect
+        await this.start(true);
+    }
+    
+    // Pairing code functionality removed - conflicts with WhatsApp Web connection
+    
+    async forceQR() {
+        try {
+            console.log(`🚀 Force QR requested for user ${this.userId}`);
             
+            // Clear any existing timeouts
             if (this.reconnectTimeout) {
                 clearTimeout(this.reconnectTimeout);
                 this.reconnectTimeout = null;
             }
             
+            // Disconnect if connected
             if (this.sock) {
-                await this.sock.end();
+                try {
+                    // Properly close WebSocket without triggering error events
+                    if (this.sock.ws && this.sock.ws.readyState === 1) {
+                        this.sock.ws.close();
+                    }
+                    await this.sock.end();
+                } catch (e) {
+                    // Ignore expected WebSocket close errors during forced disconnect
+                    console.log(`⚠️ Expected close error for user ${this.userId}: ${e.message}`);
+                }
                 this.sock = null;
             }
             
             this.isConnected = false;
-            this.connectionState = 'disconnected';
+            this.connectionState = 'generating_qr';
             this.qrCodeData = null;
             this.pairingCode = null;
             
-            console.log(`🔌 Usuário ${this.userId} desconectado`);
+            // Start with force new QR
+            await this.start(true);
+            
+            // Wait for QR generation with timeout
+            return new Promise((resolve, reject) => {
+                let attempts = 0;
+                const maxAttempts = 20; // 10 seconds max
+                
+                const checkQR = () => {
+                    attempts++;
+                    if (this.qrCodeData) {
+                        resolve({ success: true, qrCode: this.qrCodeData });
+                    } else if (attempts >= maxAttempts) {
+                        reject(new Error('QR generation timeout'));
+                    } else if (this.connectionState === 'error') {
+                        reject(new Error('Connection error during QR generation'));
+                    } else {
+                        setTimeout(checkQR, 500);
+                    }
+                };
+                
+                // Start checking immediately
+                setTimeout(checkQR, 100);
+            });
+            
         } catch (error) {
-            console.error(`Erro ao desconectar usuário ${this.userId}:`, error);
+            console.error(`❌ Error in forceQR for user ${this.userId}:`, error);
+            return { success: false, error: error.message };
         }
+    }
+    
+    getStatus() {
+        // Do a more thorough connection check
+        let actuallyConnected = this.isConnected;
+        
+        // If we think we're connected but sock is null, we're actually disconnected
+        if (this.isConnected && !this.sock) {
+            console.log(`⚠️ User ${this.userId} marked as connected but socket is null, correcting status...`);
+            this.isConnected = false;
+            this.connectionState = 'disconnected';
+            actuallyConnected = false;
+        }
+        
+        return {
+            userId: this.userId,
+            connected: actuallyConnected,
+            state: this.connectionState,
+            qrCode: this.qrCodeData,
+            qrCodeExists: !!this.qrCodeData,
+            pairingCode: this.pairingCode,
+            pairingCodeExists: !!this.pairingCode
+        };
     }
 }
 
-function isJidBroadcast(jid) {
-    return [
-        '@broadcast',
-        '@newsletter'
-    ].some(suffix => jid?.includes?.(suffix));
-}
-
-// Get or create user session
+// Função para obter ou criar sessão de usuário
 function getUserSession(userId) {
     if (!userSessions.has(userId)) {
-        userSessions.set(userId, new UserWhatsAppSession(userId));
+        const session = new UserWhatsAppSession(userId);
+        userSessions.set(userId, session);
+        
+        // Check if session exists before forcing new QR
+        const authPath = path.join(__dirname, 'sessions', session.authFolder);
+        const hasExistingSession = fs.existsSync(authPath) && fs.existsSync(path.join(authPath, 'creds.json'));
+        
+        // Add random delay to prevent simultaneous connections
+        const initDelay = Math.random() * 1000; // 0-1 second random delay
+        
+        setTimeout(() => {
+            if (hasExistingSession) {
+                console.log(`🔄 Found existing session for user ${userId}, attempting restore...`);
+                session.start(false); // Try to restore existing session
+            } else {
+                console.log(`🆕 No existing session for user ${userId}, creating new...`);
+                session.start(true); // Force new QR for first time
+            }
+        }, initDelay);
     }
     return userSessions.get(userId);
 }
 
 // API Endpoints
+app.get('/status/:userId', async (req, res) => {
+    const userId = req.params.userId;
+    const session = getUserSession(userId);
+    
+    // Basic status
+    const basicStatus = session.getStatus();
+    
+    // If claiming to be connected, do a real connection test
+    if (basicStatus.connected && session.sock) {
+        try {
+            // Try a simple query to test if connection is really working
+            await session.sock.query({
+                tag: 'iq',
+                attrs: {
+                    type: 'get',
+                    xmlns: 'w:profile:picture'
+                }
+            });
+            // Connection test passed
+        } catch (error) {
+            console.log(`⚠️ Connection test failed for user ${userId}: ${error.message}`);
+            // Connection test failed, update status
+            session.isConnected = false;
+            session.connectionState = 'disconnected';
+            basicStatus.connected = false;
+            basicStatus.state = 'disconnected';
+        }
+    }
+    
+    res.json({
+        success: true,
+        ...basicStatus
+    });
+});
 
-// Send message endpoint
+app.get('/qr/:userId', async (req, res) => {
+    try {
+        const userId = req.params.userId;
+        const session = getUserSession(userId);
+        
+        console.log(`📱 QR requested for user ${userId}, state: ${session.connectionState}, hasQR: ${!!session.qrCodeData}`);
+        
+        // If already connected, don't generate new QR
+        if (session.isConnected) {
+            return res.json({
+                success: false,
+                error: 'Already connected',
+                connected: true
+            });
+        }
+        
+        // If QR exists and is fresh (not expired), return it
+        if (session.qrCodeData && session.connectionState === 'qr_generated') {
+            return res.json({
+                success: true,
+                qrCode: session.qrCodeData
+            });
+        }
+        
+        // Generate new QR
+        try {
+            const result = await session.forceQR();
+            res.json(result);
+        } catch (error) {
+            console.error(`❌ QR generation failed for user ${userId}:`, error);
+            res.json({
+                success: false,
+                message: 'Erro ao gerar QR Code',
+                error: error.message
+            });
+        }
+        
+    } catch (error) {
+        console.error('QR endpoint error:', error);
+        res.json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
 app.post('/send/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
         const { number, message } = req.body;
         
-        if (!number || !message) {
+        const session = userSessions.get(userId);
+        
+        if (!session) {
             return res.json({
                 success: false,
-                error: 'Number and message are required'
+                error: 'Sessão não encontrada para este usuário'
             });
         }
         
-        const session = getUserSession(userId);
-        
-        if (!session.isConnected) {
+        // More lenient connection check - if sock exists, try to send
+        if (!session.sock) {
             return res.json({
                 success: false,
-                error: `WhatsApp não conectado para usuário ${userId}. Por favor, conecte primeiro.`
+                error: 'WhatsApp não conectado para este usuário'
             });
+        }
+        
+        // If we think we're disconnected but socket exists, try to send anyway
+        if (!session.isConnected) {
+            console.log(`⚠️ User ${userId} marked as disconnected but socket exists, attempting message send...`);
         }
         
         const result = await session.sendMessage(number, message);
@@ -383,10 +637,11 @@ app.post('/send/:userId', async (req, res) => {
         res.json({
             success: true,
             messageId: result.key.id,
-            result: result
+            response: result
         });
+        
     } catch (error) {
-        console.error('Send message error:', error);
+        console.error('Erro ao enviar mensagem:', error);
         res.json({
             success: false,
             error: error.message
@@ -394,124 +649,6 @@ app.post('/send/:userId', async (req, res) => {
     }
 });
 
-// Generate QR Code endpoint
-app.post('/generate-qr/:userId', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-        console.log(`📱 QR code solicitado para usuário ${userId}`);
-        
-        const session = getUserSession(userId);
-        
-        // Force new connection to generate fresh QR
-        await session.start(true);
-        
-        // Wait for QR generation
-        let attempts = 0;
-        const maxAttempts = 15; // 15 seconds max wait
-        
-        while (!session.qrCodeData && attempts < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            attempts++;
-        }
-        
-        if (session.qrCodeData) {
-            res.json({
-                success: true,
-                qrCode: session.qrCodeData,
-                message: 'QR Code gerado com sucesso'
-            });
-        } else {
-            res.json({
-                success: false,
-                error: 'Não foi possível gerar o QR Code. Tente novamente.',
-                connectionState: session.connectionState
-            });
-        }
-    } catch (error) {
-        console.error('Generate QR error:', error);
-        res.json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Get QR Code endpoint (existing QR)
-app.get('/qr/:userId', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-        const session = getUserSession(userId);
-        
-        if (session.qrCodeData) {
-            res.json({
-                success: true,
-                qrCode: session.qrCodeData,
-                connectionState: session.connectionState
-            });
-        } else {
-            res.json({
-                success: false,
-                message: 'QR Code não disponível',
-                connectionState: session.connectionState
-            });
-        }
-    } catch (error) {
-        res.json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Connection status endpoint
-app.get('/status/:userId', (req, res) => {
-    try {
-        const userId = req.params.userId;
-        const session = userSessions.get(userId);
-        
-        if (!session) {
-            return res.json({
-                success: true,
-                status: 'disconnected',
-                message: 'Sessão não encontrada'
-            });
-        }
-        
-        res.json({
-            success: true,
-            ...session.getStatus()
-        });
-    } catch (error) {
-        res.json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Connect endpoint
-app.post('/connect/:userId', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-        const session = getUserSession(userId);
-        
-        // Start connection (will check if already connected)
-        session.start();
-        
-        res.json({
-            success: true,
-            message: `Iniciando conexão para usuário ${userId}`,
-            status: session.getStatus()
-        });
-    } catch (error) {
-        res.json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Disconnect endpoint
 app.post('/disconnect/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
@@ -524,7 +661,7 @@ app.post('/disconnect/:userId', async (req, res) => {
         
         res.json({
             success: true,
-            message: `Usuário ${userId} desconectado`
+            message: 'WhatsApp desconectado para o usuário'
         });
     } catch (error) {
         res.json({
@@ -534,19 +671,17 @@ app.post('/disconnect/:userId', async (req, res) => {
     }
 });
 
-// Reconnect endpoint
 app.post('/reconnect/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
         const session = getUserSession(userId);
         
-        // Force reconnection
-        await session.start(true);
+        // Force reconnect always generates new QR
+        await session.reconnect();
         
         res.json({
             success: true,
-            message: `Reconexão iniciada para usuário ${userId}`,
-            status: session.getStatus()
+            message: 'Gerando novo QR Code...'
         });
     } catch (error) {
         res.json({
@@ -560,43 +695,11 @@ app.post('/reconnect/:userId', async (req, res) => {
 app.post('/force-qr/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
-        console.log(`🔄 Force QR solicitado para usuário ${userId}`);
-        
         const session = getUserSession(userId);
         
-        // Disconnect first, then generate new QR
-        await session.disconnect();
-        
-        // Wait a bit
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Start fresh connection
-        await session.start(true);
-        
-        // Wait for QR generation
-        let attempts = 0;
-        const maxAttempts = 15;
-        
-        while (!session.qrCodeData && session.connectionState !== 'qr_ready' && attempts < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            attempts++;
-        }
-        
-        if (session.qrCodeData) {
-            res.json({
-                success: true,
-                qrCode: session.qrCodeData,
-                message: 'Novo QR Code gerado com sucesso'
-            });
-        } else {
-            res.json({
-                success: false,
-                error: 'Não foi possível gerar novo QR Code',
-                connectionState: session.connectionState
-            });
-        }
+        const result = await session.forceQR();
+        res.json(result);
     } catch (error) {
-        console.error('Force QR error:', error);
         res.json({
             success: false,
             error: error.message
@@ -604,72 +707,11 @@ app.post('/force-qr/:userId', async (req, res) => {
     }
 });
 
-// Pairing code endpoints
-app.post('/generate-pairing-code/:userId', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-        const { phoneNumber } = req.body;
-        
-        if (!phoneNumber) {
-            return res.json({
-                success: false,
-                error: 'Número de telefone é obrigatório'
-            });
-        }
-        
-        console.log(`📱 Pairing code solicitado para usuário ${userId} com número ${phoneNumber}`);
-        
-        const session = getUserSession(userId);
-        const code = await session.generatePairingCode(phoneNumber);
-        
-        res.json({
-            success: true,
-            pairingCode: code,
-            message: 'Código de pareamento gerado com sucesso',
-            phoneNumber: phoneNumber
-        });
-    } catch (error) {
-        console.error('Generate pairing code error:', error);
-        res.json({
-            success: false,
-            error: error.message
-        });
-    }
-});
+// Endpoint para código de pareamento
+// Pairing code endpoint removed - functionality disabled
 
 // Endpoint para buscar código de pareamento existente
-app.get('/pairing-code/:userId', (req, res) => {
-    try {
-        const userId = req.params.userId;
-        const session = userSessions.get(userId);
-        
-        if (!session) {
-            return res.json({
-                success: false,
-                error: 'Sessão não encontrada'
-            });
-        }
-        
-        if (session.pairingCode) {
-            res.json({
-                success: true,
-                pairingCode: session.pairingCode,
-                state: session.connectionState
-            });
-        } else {
-            res.json({
-                success: false,
-                message: 'Código de pareamento não disponível'
-            });
-        }
-    } catch (error) {
-        console.error('Get pairing code error:', error);
-        res.json({
-            success: false,
-            error: 'Internal server error'
-        });
-    }
-});
+// GET pairing code endpoint removed - functionality disabled
 
 // Endpoint para listar todos os usuários conectados (admin)
 app.get('/sessions', (req, res) => {
@@ -696,9 +738,7 @@ app.get('/health', (req, res) => {
         connectedSessions,
         totalSessions,
         uptime: process.uptime(),
-        timestamp: new Date().toISOString(),
-        port: UNIFIED_PORT,
-        environment: isRailway ? 'Railway' : 'Local'
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -769,20 +809,9 @@ process.on('SIGINT', () => {
     });
 });
 
-// UNIFIED PORT SERVER START
-app.listen(UNIFIED_PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor Baileys Multi-User rodando na porta ${UNIFIED_PORT}`);
+const PORT = 3001;
+app.listen(PORT, () => {
+    console.log(`🚀 Servidor Baileys Multi-User rodando na porta ${PORT}`);
     console.log(`✅ Sistema de recuperação automática ativo`);
     console.log(`💾 Sessões persistentes em ./sessions/`);
-    console.log(`🌍 Listening on 0.0.0.0:${UNIFIED_PORT} for all interfaces`);
-    
-    if (isRailway) {
-        console.log(`⚡ Railway deployment mode ACTIVE`);
-        console.log(`🔗 External access: Railway domain`);
-        console.log(`🔗 Internal access: 127.0.0.1:${UNIFIED_PORT}`);
-        console.log(`🎯 UNIFIED PORT solves Railway/Local conflict!`);
-    } else {
-        console.log(`💻 Local development mode`);
-        console.log(`🔗 Local access: http://localhost:${UNIFIED_PORT}`);
-    }
 });

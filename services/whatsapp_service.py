@@ -8,14 +8,20 @@ class WhatsAppService:
     def __init__(self):
         # Support Railway environment with internal service communication
         import os
-        # Prioridade: WHATSAPP_URL > RAILWAY_STATIC_URL > default interno
-        self.baileys_url = os.getenv('WHATSAPP_URL')
-        if not self.baileys_url:
-            railway_internal_url = os.getenv('RAILWAY_STATIC_URL')
-            if railway_internal_url:
-                self.baileys_url = f"https://{railway_internal_url}"
-            else:
-                self.baileys_url = "http://127.0.0.1:3001"
+        
+        # Check for Railway environment variables
+        railway_environment = os.getenv('RAILWAY_ENVIRONMENT_NAME')
+        whatsapp_url = os.getenv('WHATSAPP_SERVICE_URL')
+        
+        if whatsapp_url:
+            # Use explicit WhatsApp service URL if provided
+            self.baileys_url = whatsapp_url
+        elif railway_environment:
+            # Railway environment - services communicate internally via localhost
+            self.baileys_url = "http://127.0.0.1:3001"
+        else:
+            # Local development
+            self.baileys_url = "http://localhost:3001"
         
         self.headers = {
             'Content-Type': 'application/json'
@@ -170,42 +176,75 @@ class WhatsAppService:
     def check_instance_status(self, user_id: int) -> Dict[str, Any]:
         """
         Check if WhatsApp instance is connected and ready
+        Prioritizes health endpoint for reliability when individual endpoint fails
         """
         try:
-            url = f"{self.baileys_url}/status/{user_id}"
+            # Check health status first (more reliable)
+            health_status = self.get_health_status()
+            connected_sessions = health_status.get('connectedSessions', 0) if health_status.get('success') else 0
             
-            response = requests.get(
-                url,
-                headers=self.headers,
-                timeout=20  # Railway optimized timeout
-            )
+            # Quick individual status check with short timeout
+            individual_connected = False
+            state = 'unknown'
+            qr_code = None
             
-            if response.status_code == 200:
-                result = response.json()
+            try:
+                url = f"{self.baileys_url}/status/{user_id}"
+                response = requests.get(
+                    url,
+                    headers=self.headers,
+                    timeout=3  # Short timeout to avoid hanging
+                )
                 
-                # Check if the status indicates a real connection issue
-                state = result.get('state', 'unknown')
-                connected = result.get('connected', False)
-                
-                # Log connection status for debugging
-                if connected:
-                    logger.info(f"WhatsApp status for user {user_id}: connected={connected}, state={state}")
+                if response.status_code == 200:
+                    result = response.json()
+                    individual_connected = result.get('connected', False)
+                    state = result.get('state', 'unknown')
+                    qr_code = result.get('qrCode')
+                    logger.info(f"Individual status OK for user {user_id}: connected={individual_connected}, state={state}")
                 else:
-                    logger.warning(f"WhatsApp status for user {user_id}: connected={connected}, state={state}")
-                
-                return {
-                    'success': True,
-                    'connected': connected,
-                    'state': state,
-                    'qrCode': result.get('qrCode'),  # ✅ Match the key name exactly
-                    'response': result
-                }
+                    logger.warning(f"Individual status failed: {response.status_code}")
+                    result = {'connected': False, 'state': 'http_error', 'qrCode': None}
+                    
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                logger.warning(f"Individual status timeout/connection for user {user_id}: {e}")
+                result = {'connected': False, 'state': 'timeout', 'qrCode': None}
+            except Exception as e:
+                logger.warning(f"Individual status error for user {user_id}: {e}")
+                result = {'connected': False, 'state': 'error', 'qrCode': None}
+            
+            # Determine final connection status - prioritize health endpoint
+            if connected_sessions > 0:
+                # Health shows connected sessions - trust it
+                connected = True
+                verification_method = "health_primary"
+                corrected_state = "connected_health_verified"
+                logger.info(f"Health endpoint shows {connected_sessions} connected sessions - status: CONNECTED")
+            elif individual_connected and connected_sessions == 0:
+                # Individual shows connected but health shows 0 - likely stale
+                connected = False
+                verification_method = "health_corrected"
+                corrected_state = "disconnected_health_corrected"
+                logger.warning(f"Individual shows connected but health shows 0 sessions - status: DISCONNECTED")
             else:
-                return {
-                    'success': False,
-                    'error': f"HTTP Error: {response.status_code}",
-                    'details': response.text
-                }
+                # Both show disconnected or individual failed
+                connected = individual_connected
+                verification_method = "individual" if not result.get('state') in ['timeout', 'error'] else "health_fallback"
+                corrected_state = result.get('state', 'unknown')
+                logger.info(f"Status determined by individual endpoint: connected={connected}, state={corrected_state}")
+            
+            # Log final status
+            status_icon = "✅" if connected else "❌"
+            logger.info(f"WhatsApp status for user {user_id}: {status_icon} connected={connected}, method={verification_method}")
+            
+            return {
+                'success': True,
+                'connected': connected,
+                'state': corrected_state,
+                'verification_method': verification_method,
+                'qrCode': result.get('qrCode'),
+                'response': result
+            }
                 
         except requests.exceptions.ConnectionError:
             logger.error("Baileys server not running")

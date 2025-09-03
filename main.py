@@ -1,10 +1,3 @@
-# Configure runtime for Railway deployment
-try:
-    import runtime_config
-    runtime_config.configure_for_railway()
-except ImportError:
-    pass
-
 import logging
 import os
 import asyncio
@@ -547,8 +540,8 @@ async def manage_clients_callback(update: Update, context: ContextTypes.DEFAULT_
                 await query.edit_message_text("⚠️ Conta inativa. Assine o plano para continuar.")
                 return
             
-            # Get clients
-            clients = session.query(Client).filter_by(user_id=db_user.id).order_by(Client.created_at.desc()).all()
+            # Get clients ordered by due date (descending - most urgent first)
+            clients = session.query(Client).filter_by(user_id=db_user.id).order_by(Client.due_date.desc()).all()
             
             if not clients:
                 text = """
@@ -557,26 +550,50 @@ async def manage_clients_callback(update: Update, context: ContextTypes.DEFAULT_
 📋 Nenhum cliente cadastrado ainda.
 
 Comece adicionando seu primeiro cliente!
-
-📲 Use o teclado abaixo para navegar:
-➕ **Adicionar Cliente** - Cadastrar novo cliente
-🏠 **Menu Principal** - Voltar ao menu
 """
-            else:
-                text = f"👥 **Gerenciar Clientes**\n\n📋 **{len(clients)} cliente(s) cadastrado(s):**\n\n"
-                
-                for client in clients[:10]:  # Show max 10 clients
-                    status_emoji = "✅" if client.status == 'active' else "❌"
-                    text += f"{status_emoji} **{client.name}**\n"
-                    text += f"📱 {client.phone_number}\n"
-                    text += f"📦 {client.plan_name}\n"
-                    text += f"💰 R$ {client.plan_price:.2f}\n"
-                    text += f"📅 Vence: {client.due_date.strftime('%d/%m/%Y')}\n\n"
-                
-                text += "\n📲 Use o teclado abaixo para navegar"
+                keyboard = [
+                    [InlineKeyboardButton("➕ Adicionar Cliente", callback_data="add_client")],
+                    [InlineKeyboardButton("🔍 Buscar Cliente", callback_data="search_client")],
+                    [InlineKeyboardButton("🔙 Menu Principal", callback_data="main_menu")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+                return
             
-            reply_markup = get_client_keyboard()
-            await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            # Create client list with inline buttons
+            from datetime import date
+            today = date.today()
+            
+            text = f"👥 **Gerenciar Clientes** ({len(clients)} total)\n\n📋 Selecione um cliente para gerenciar:"
+            
+            keyboard = []
+            for client in clients:
+                # Status indicator
+                if client.status == 'active':
+                    if client.due_date < today:
+                        status = "🔴"  # Overdue
+                    elif (client.due_date - today).days <= 7:
+                        status = "🟡"  # Due soon
+                    else:
+                        status = "🟢"  # Active
+                else:
+                    status = "⚫"  # Inactive
+                
+                # Format button text
+                due_str = client.due_date.strftime('%d/%m')
+                button_text = f"{status} {client.name} - {due_str}"
+                
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"client_{client.id}")])
+            
+            # Add navigation buttons
+            keyboard.extend([
+                [InlineKeyboardButton("➕ Adicionar Cliente", callback_data="add_client")],
+                [InlineKeyboardButton("🔍 Buscar Cliente", callback_data="search_client")],
+                [InlineKeyboardButton("🔙 Menu Principal", callback_data="main_menu")]
+            ])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
             
     except Exception as e:
         logger.error(f"Error managing clients: {e}")
@@ -1135,12 +1152,7 @@ async def handle_client_due_date(update: Update, context: ContextTypes.DEFAULT_T
     
     try:
         due_date = datetime.strptime(date_text, '%d/%m/%Y').date()
-        if due_date <= date.today():
-            await update.message.reply_text(
-                "❌ Data deve ser futura. Digite uma data válida.\n**Exemplo:** 25/12/2024",
-                reply_markup=get_add_client_due_date_keyboard()
-            )
-            return WAITING_CLIENT_DUE_DATE
+        # Removed future date validation - now allows past dates
     except ValueError:
         await update.message.reply_text(
             "❌ Data inválida. Use o formato DD/MM/AAAA.\n**Exemplo:** 25/12/2024",
@@ -1356,16 +1368,18 @@ async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT
             status = whatsapp_service.check_instance_status(db_user.id)
             
             if status.get('success') and status.get('connected'):
-                # Connected - show connected status
-                status_text = """✅ **WhatsApp Conectado**
+                # Connected - show connected status with QR option always available
+                verification_method = status.get('verification_method', 'individual')
+                status_text = f"""✅ **WhatsApp Conectado**
 
 🟢 Status: Conectado e funcionando
 📱 Pronto para enviar mensagens automáticas
-⏰ Sistema de lembretes ativo"""
+⏰ Sistema de lembretes ativo
+🔍 Verificação: {verification_method}"""
                 
                 keyboard = [
-                    [InlineKeyboardButton("🔄 Atualizar", callback_data="whatsapp_status")],
-                    [InlineKeyboardButton("🔌 Desconectar", callback_data="whatsapp_disconnect")],
+                    [InlineKeyboardButton("📱 Novo QR Code", callback_data="whatsapp_reconnect")],
+                    [InlineKeyboardButton("🔄 Atualizar", callback_data="whatsapp_status"), InlineKeyboardButton("🔌 Desconectar", callback_data="whatsapp_disconnect")],
                     [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
                 ]
                 
@@ -1415,7 +1429,7 @@ async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT
                 
                 keyboard = [
                     [InlineKeyboardButton("📱 QR Code", callback_data="whatsapp_reconnect")],
-                    [InlineKeyboardButton("🔐 Código", callback_data="whatsapp_pairing_code")],
+
                     [InlineKeyboardButton("🔄 Atualizar", callback_data="whatsapp_status")],
                     [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
                 ]
@@ -1457,7 +1471,6 @@ async def whatsapp_disconnect_callback(update: Update, context: ContextTypes.DEF
             
             keyboard = [
                 [InlineKeyboardButton("📱 QR Code", callback_data="whatsapp_reconnect")],
-                [InlineKeyboardButton("🔐 Código", callback_data="whatsapp_pairing_code")],
                 [InlineKeyboardButton("🔄 Verificar Status", callback_data="whatsapp_status")],
                 [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
             ]
@@ -1599,117 +1612,11 @@ Tente novamente em alguns segundos."""
         logger.error(f"❌ Error in whatsapp_reconnect_callback: {e}")
         await query.edit_message_text("❌ Erro ao reconectar WhatsApp.")
 
-async def whatsapp_pairing_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start pairing code process"""
-    if not update.callback_query:
-        return
-        
-    query = update.callback_query
-    await query.answer()
-    
-    logger.info("🔐 WhatsApp pairing code requested")
-    
-    # Explain pairing code process
-    explanation_text = """🔐 **Conexão por Código de Pareamento**
+# Pairing code functionality completely removed - caused WhatsApp connection conflicts
 
-✨ **Como funciona:**
-• Você digita seu número de telefone completo
-• Geramos um código de 8 dígitos 
-• Você digita o código no seu WhatsApp
-• Conecta sem precisar escanear QR!
+# All pairing code functionality has been completely removed
 
-📱 **Digite seu número completo com DDD:**
-Exemplo: 5561999887766"""
-    
-    await query.edit_message_text(explanation_text, parse_mode='Markdown')
-    return "WAITING_PHONE_NUMBER"
-
-async def handle_pairing_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone number for pairing code"""
-    if not update.message or not update.message.text:
-        await update.message.reply_text("❌ Por favor, digite um número válido.")
-        return "WAITING_PHONE_NUMBER"
-        
-    phone_number = update.message.text.strip()
-    
-    # Basic validation
-    if not phone_number.isdigit() or len(phone_number) < 10:
-        await update.message.reply_text("""❌ **Número inválido!**
-
-📱 Digite o número completo com DDD.
-Exemplo: 5561999887766
-
-Tente novamente:""", parse_mode='Markdown')
-        return "WAITING_PHONE_NUMBER"
-    
-    # Show processing message
-    await update.message.reply_text("🔐 **Gerando código de pareamento...**\n\n⏳ Aguarde alguns segundos...", parse_mode='Markdown')
-    
-    try:
-        # Get user info
-        with db_service.get_session() as session:
-            db_user = session.query(User).filter_by(telegram_id=str(update.effective_user.id)).first()
-            if not db_user:
-                await update.message.reply_text("❌ Usuário não encontrado. Use /start para se registrar.")
-                return ConversationHandler.END
-            
-            # Request pairing code
-            result = whatsapp_service.request_pairing_code(db_user.id, phone_number)
-            
-            if result.get('success'):
-                pairing_code = result.get('pairing_code')
-                
-                success_text = f"""✅ **Código Gerado!**
-
-🔐 **Seu código de pareamento:** `{pairing_code}`
-
-📱 **Como usar:**
-1️⃣ Abra o WhatsApp no seu celular
-2️⃣ Vá em Configurações > Aparelhos conectados
-3️⃣ Clique em "Conectar um aparelho"
-4️⃣ Clique em "Conectar com código de pareamento"
-5️⃣ Digite o código: `{pairing_code}`
-
-⏱️ **O código expira em alguns minutos!**"""
-                
-                keyboard = [
-                    [InlineKeyboardButton("🔄 Verificar Status", callback_data="whatsapp_status")],
-                    [InlineKeyboardButton("🆕 Novo Código", callback_data="whatsapp_pairing_code")],
-                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text(success_text, reply_markup=reply_markup, parse_mode='Markdown')
-                
-            else:
-                error_msg = result.get('error', 'Erro desconhecido')
-                error_text = f"""❌ **Erro ao gerar código**
-
-🔧 **Erro:** {error_msg}
-
-Tente novamente ou use QR Code."""
-                
-                keyboard = [
-                    [InlineKeyboardButton("🔄 Tentar Novamente", callback_data="whatsapp_pairing_code")],
-                    [InlineKeyboardButton("📱 Usar QR Code", callback_data="whatsapp_reconnect")],
-                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text(error_text, reply_markup=reply_markup, parse_mode='Markdown')
-                
-    except Exception as e:
-        logger.error(f"Error in pairing code process: {e}")
-        await update.message.reply_text("""❌ **Erro interno**
-
-Tente usar QR Code ou contate o suporte.""")
-    
-    return ConversationHandler.END
-
-async def cancel_pairing_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel pairing code process"""
-    await update.message.reply_text("❌ Processo cancelado.")
-    return ConversationHandler.END
+# Pairing code cancellation function also removed
 
 async def schedule_settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show schedule settings menu"""
@@ -2991,9 +2898,7 @@ async def handle_renew_custom_date(update: Update, context: ContextTypes.DEFAULT
         from datetime import datetime, date
         new_due_date = datetime.strptime(date_text, '%d/%m/%Y').date()
         
-        if new_due_date <= date.today():
-            await update.message.reply_text("❌ Data deve ser futura. Digite uma data válida (DD/MM/AAAA):")
-            return RENEW_WAITING_CUSTOM_DATE
+        # Removed future date validation - now allows past dates
     except ValueError:
         await update.message.reply_text("❌ Data inválida. Use o formato DD/MM/AAAA (ex: 31/12/2024):")
         return RENEW_WAITING_CUSTOM_DATE
@@ -3495,10 +3400,7 @@ async def handle_edit_due_date(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         from datetime import datetime, date
         new_due_date = datetime.strptime(date_text, '%d/%m/%Y').date()
-        
-        if new_due_date <= date.today():
-            await update.message.reply_text("❌ Data deve ser futura. Digite uma data válida (DD/MM/AAAA):")
-            return EDIT_WAITING_DUE_DATE
+        # Removed future date validation - now allows past dates
     except ValueError:
         await update.message.reply_text("❌ Data inválida. Use o formato DD/MM/AAAA (ex: 31/12/2024):")
         return EDIT_WAITING_DUE_DATE
@@ -3715,7 +3617,7 @@ async def whatsapp_status_message(update: Update, context: ContextTypes.DEFAULT_
                 
                 keyboard = [
                     [InlineKeyboardButton("📱 QR Code", callback_data="whatsapp_reconnect")],
-                    [InlineKeyboardButton("🔐 Código", callback_data="whatsapp_pairing_code")],
+
                     [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
                 ]
             
@@ -4841,6 +4743,96 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by Updates."""
     logger.error(f"Update {update} caused error {context.error}")
 
+async def set_morning_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle set morning time callback"""
+    if not update.callback_query:
+        return
+        
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    try:
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user or not db_user.is_active:
+                await query.edit_message_text("❌ Conta inativa.")
+                return
+            
+            text = """🌅 **Configurar Horário Matinal**
+
+⏰ Digite o horário para envio dos lembretes matinais.
+
+📝 **Formato:** HH:MM (exemplo: 09:30)
+🕘 **Padrão atual:** 09:00
+
+💡 *Este horário será usado para enviar lembretes de:*
+• 2 dias antes do vencimento
+• 1 dia antes do vencimento  
+• No dia do vencimento
+• 1 dia após vencimento (em atraso)"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔙 Voltar", callback_data="schedule_settings")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+            # Return state for conversation handler
+            return SCHEDULE_WAITING_MORNING_TIME
+            
+    except Exception as e:
+        logger.error(f"Error setting morning time: {e}")
+        await query.edit_message_text("❌ Erro ao configurar horário matinal.")
+
+async def set_report_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle set report time callback"""
+    if not update.callback_query:
+        return
+        
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    try:
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user or not db_user.is_active:
+                await query.edit_message_text("❌ Conta inativa.")
+                return
+            
+            text = """📊 **Configurar Horário do Relatório**
+
+⏰ Digite o horário para receber o relatório diário.
+
+📝 **Formato:** HH:MM (exemplo: 08:30)
+🕗 **Padrão atual:** 08:00
+
+💡 *O relatório diário inclui:*
+• Clientes em atraso
+• Vencimentos de hoje
+• Vencimentos de amanhã
+• Vencimentos em 2 dias"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔙 Voltar", callback_data="schedule_settings")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+            # Return state for conversation handler
+            return SCHEDULE_WAITING_REPORT_TIME
+            
+    except Exception as e:
+        logger.error(f"Error setting report time: {e}")
+        await query.edit_message_text("❌ Erro ao configurar horário do relatório.")
+
 def main():
     """Start the Telegram bot"""
     try:
@@ -5014,10 +5006,9 @@ def main():
         
         # Template handlers already implemented above - no external imports needed
         
-        # Payment system handlers
-        from handlers.user_handlers import subscribe_now_callback, check_payment_callback
-        application.add_handler(CallbackQueryHandler(subscribe_now_callback, pattern="^subscribe_now$"))
-        application.add_handler(CallbackQueryHandler(check_payment_callback, pattern="^check_payment_.*$"))
+        # Payment system handlers - disabled temporarily (functions need to be implemented)
+        # application.add_handler(CallbackQueryHandler(subscribe_now_callback, pattern="^subscribe_now$"))
+        # application.add_handler(CallbackQueryHandler(check_payment_callback, pattern="^check_payment_.*$"))
 
         # Other callbacks
         application.add_handler(CallbackQueryHandler(dashboard_callback, pattern="^dashboard$"))
@@ -5025,24 +5016,7 @@ def main():
         application.add_handler(CallbackQueryHandler(whatsapp_disconnect_callback, pattern="^whatsapp_disconnect$"))
         application.add_handler(CallbackQueryHandler(whatsapp_reconnect_callback, pattern="^whatsapp_reconnect$"))
         
-        # WhatsApp Pairing Code conversation handler
-        pairing_code_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(whatsapp_pairing_code_callback, pattern="^whatsapp_pairing_code$")],
-            states={
-                "WAITING_PHONE_NUMBER": [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pairing_phone_number),
-                ]
-            },
-            fallbacks=[
-                CommandHandler("cancel", cancel_pairing_code),
-                MessageHandler(filters.Regex("^(🔙 Cancelar|Cancelar)$"), cancel_pairing_code)
-            ],
-            per_message=False,  
-            per_chat=True,      
-            per_user=True,      
-            conversation_timeout=600 
-        )
-        application.add_handler(pairing_code_handler)
+        # WhatsApp Pairing Code handler removed - functionality disabled due to conflicts
         application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
         
         # Unknown callback handler
@@ -5066,96 +5040,6 @@ def main():
         except Exception as e:
             logger.error(f"Error stopping scheduler: {e}")
 
-async def set_morning_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle set morning time callback"""
-    if not update.callback_query:
-        return
-        
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    
-    try:
-        with db_service.get_session() as session:
-            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
-            
-            if not db_user or not db_user.is_active:
-                await query.edit_message_text("❌ Conta inativa.")
-                return
-            
-            text = """🌅 **Configurar Horário Matinal**
-
-⏰ Digite o horário para envio dos lembretes matinais.
-
-📝 **Formato:** HH:MM (exemplo: 09:30)
-🕘 **Padrão atual:** 09:00
-
-💡 *Este horário será usado para enviar lembretes de:*
-• 2 dias antes do vencimento
-• 1 dia antes do vencimento  
-• No dia do vencimento
-• 1 dia após vencimento (em atraso)"""
-            
-            keyboard = [
-                [InlineKeyboardButton("🔙 Voltar", callback_data="schedule_settings")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-            
-            # Return state for conversation handler
-            return SCHEDULE_WAITING_MORNING_TIME
-            
-    except Exception as e:
-        logger.error(f"Error setting morning time: {e}")
-        await query.edit_message_text("❌ Erro ao configurar horário matinal.")
-
-
-async def set_report_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle set report time callback"""
-    if not update.callback_query:
-        return
-        
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    
-    try:
-        with db_service.get_session() as session:
-            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
-            
-            if not db_user or not db_user.is_active:
-                await query.edit_message_text("❌ Conta inativa.")
-                return
-            
-            text = """📊 **Configurar Horário do Relatório**
-
-⏰ Digite o horário para receber o relatório diário.
-
-📝 **Formato:** HH:MM (exemplo: 08:30)
-🕗 **Padrão atual:** 08:00
-
-💡 *O relatório diário inclui:*
-• Clientes em atraso
-• Vencimentos de hoje
-• Vencimentos de amanhã
-• Vencimentos em 2 dias"""
-            
-            keyboard = [
-                [InlineKeyboardButton("🔙 Voltar", callback_data="schedule_settings")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-            
-            # Return state for conversation handler
-            return SCHEDULE_WAITING_REPORT_TIME
-            
-    except Exception as e:
-        logger.error(f"Error setting report time: {e}")
-        await query.edit_message_text("❌ Erro ao configurar horário do relatório.")
 
 async def reset_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle reset schedule to defaults callback"""

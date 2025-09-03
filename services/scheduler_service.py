@@ -130,7 +130,9 @@ class SchedulerService:
                                 session.commit()
                             logger.info(f"Daily reminders completed for user {user.id}")
                         except Exception as e:
-                            logger.error(f"Error processing daily reminders for user {user.id}: {e}")
+                            logger.error(f"Error processing daily reminders for user {user.id}: {str(e)}")
+                            import traceback
+                            logger.error(f"Full traceback: {traceback.format_exc()}")
                     
                     # Check daily report - execute if time passed and not run today  
                     try:
@@ -154,7 +156,9 @@ class SchedulerService:
                                     session.commit()
                                 logger.info(f"Daily report completed for user {user.id}")
                             except Exception as e:
-                                logger.error(f"Error processing daily report for user {user.id}: {e}")
+                                logger.error(f"Error processing daily report for user {user.id}: {str(e)}")
+                                import traceback
+                                logger.error(f"Full traceback: {traceback.format_exc()}")
                     except ValueError:
                         logger.error(f"Invalid report time format for user {user.id}")
             
@@ -719,6 +723,7 @@ class SchedulerService:
             from services.whatsapp_service import whatsapp_service
             from models import User, Client, MessageTemplate, MessageLog
             from datetime import date, timedelta
+            import traceback
             
             db_service = DatabaseService()
             
@@ -779,7 +784,8 @@ class SchedulerService:
                     await self._send_reminders_by_type(session, user, clients_overdue, 'reminder_overdue', whatsapp_service)
                 
         except Exception as e:
-            logger.error(f"Error processing daily reminders for user {user_id}: {e}")
+            logger.error(f"Error processing daily reminders for user {user_id}: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
 
 
     async def _process_user_notifications_for_user(self, user_id):
@@ -788,6 +794,8 @@ class SchedulerService:
             from services.database_service import DatabaseService
             from services.telegram_service import telegram_service
             from models import User, Client
+            from datetime import date, timedelta
+            import traceback
             
             db_service = DatabaseService()
             
@@ -807,11 +815,11 @@ class SchedulerService:
                 tomorrow = today + timedelta(days=1)
                 day_after = today + timedelta(days=2)
                 
-                # Categorize clients
-                overdue = [c for c in clients if c.due_date < today and c.status == 'active']
-                due_today = [c for c in clients if c.due_date == today and c.status == 'active']
-                due_tomorrow = [c for c in clients if c.due_date == tomorrow and c.status == 'active']
-                due_in_2_days = [c for c in clients if c.due_date == day_after and c.status == 'active']
+                # Categorize clients - fixed comparison logic
+                overdue = [c for c in clients if c.due_date and c.due_date < today and c.status == 'active']
+                due_today = [c for c in clients if c.due_date and c.due_date == today and c.status == 'active']
+                due_tomorrow = [c for c in clients if c.due_date and c.due_date == tomorrow and c.status == 'active']
+                due_in_2_days = [c for c in clients if c.due_date and c.due_date == day_after and c.status == 'active']
                 
                 # Only send notification if there are relevant clients
                 if overdue or due_today or due_tomorrow or due_in_2_days:
@@ -819,11 +827,12 @@ class SchedulerService:
                         overdue, due_today, due_tomorrow, due_in_2_days
                     )
                     
-                    await telegram_service.send_notification(user.telegram_id, notification_text)
+                    await telegram_service.send_notification(str(user.telegram_id), notification_text)
                     logger.info(f"Sent daily notification to user {user.telegram_id}")
         
         except Exception as e:
-            logger.error(f"Error processing daily notifications for user {user_id}: {e}")
+            logger.error(f"Error processing daily notifications for user {user_id}: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
 
     def _check_trial_expiration(self, user, current_date):
         """Check if user's trial period has expired and send payment notification"""
