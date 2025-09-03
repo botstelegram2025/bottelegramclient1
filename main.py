@@ -1,25 +1,36 @@
 import logging
 import os
-import re
-import base64
-import io
 import asyncio
 from datetime import datetime, date, timedelta
-
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    Application, 
+    CommandHandler, 
+    CallbackQueryHandler, 
+    ConversationHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
 )
 
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import configurations and services
 from config import Config
 from services.database_service import db_service
 from services.scheduler_service import scheduler_service
-from services.whatsapp_service import whatsapp_service   # << usa o serviço já pronto
+from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
-
 
 # Conversation states
 WAITING_FOR_PHONE = 1
