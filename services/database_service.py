@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from contextlib import contextmanager
 import logging
@@ -22,10 +22,50 @@ class DatabaseService:
         """Create all database tables"""
         try:
             Base.metadata.create_all(bind=self.engine)
+            self._migrate_existing_tables()
             logger.info("Database tables created successfully")
         except Exception as e:
             logger.error(f"Error creating database tables: {e}")
             raise
+    
+    def _migrate_existing_tables(self):
+        """Add new columns to existing tables if they don't exist"""
+        try:
+            with self.engine.connect() as connection:
+                # Check if reminder_status column exists in clients table
+                result = connection.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='clients' AND column_name='reminder_status'
+                """))
+                
+                if not result.fetchone():
+                    logger.info("Adding reminder_status column to clients table")
+                    connection.execute(text("""
+                        ALTER TABLE clients 
+                        ADD COLUMN reminder_status VARCHAR(20) DEFAULT 'pending'
+                    """))
+                    connection.commit()
+                
+                # Check if last_reminder_sent column exists in clients table
+                result = connection.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='clients' AND column_name='last_reminder_sent'
+                """))
+                
+                if not result.fetchone():
+                    logger.info("Adding last_reminder_sent column to clients table")
+                    connection.execute(text("""
+                        ALTER TABLE clients 
+                        ADD COLUMN last_reminder_sent DATE
+                    """))
+                    connection.commit()
+                    
+                logger.info("Database migration completed successfully")
+                
+        except Exception as e:
+            logger.warning(f"Migration warning (may be normal for new databases): {e}")
     
     @contextmanager
     def get_session(self):

@@ -888,13 +888,15 @@ class SchedulerService:
                 day_after_tomorrow = today + timedelta(days=2)
                 
                 # SEQUENTIAL REMINDER SYSTEM: All active clients eligible for reminders
-                reminder_groups = {
-                    'reminder_2_days': session.query(Client).filter(
-                        Client.user_id == user_id,
-                        Client.status == 'active',
-                        Client.auto_reminders_enabled == True,
-                        Client.due_date == day_after_tomorrow
-                    ).all(),
+                try:
+                    # Try with new fields first
+                    reminder_groups = {
+                        'reminder_2_days': session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active',
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date == day_after_tomorrow
+                        ).all(),
                     'reminder_1_day': session.query(Client).filter(
                         Client.user_id == user_id,
                         Client.status == 'active',
@@ -913,7 +915,36 @@ class SchedulerService:
                         Client.auto_reminders_enabled == True,
                         Client.due_date < today
                     ).all()
-                }
+                    }
+                except Exception as e:
+                    # Fallback for databases without new fields
+                    logger.warning(f"Using fallback query (database may be older): {e}")
+                    reminder_groups = {
+                        'reminder_2_days': session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active',
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date == day_after_tomorrow
+                        ).all(),
+                        'reminder_1_day': session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active',
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date == tomorrow
+                        ).all(),
+                        'reminder_due_date': session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active',
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date == today
+                        ).all(),
+                        'reminder_overdue': session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active',
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date < today
+                        ).all()
+                    }
                 
                 total_clients = sum(len(clients) for clients in reminder_groups.values())
                 logger.info(f"🔄 SYNC: Found {total_clients} clients eligible for SEQUENTIAL reminders for user {user_id}")
@@ -1009,8 +1040,11 @@ class SchedulerService:
                             
                             # UPDATE LAST REMINDER INFO (BUT KEEP IN QUEUE FOR FUTURE REMINDERS!)
                             if status == 'sent':
-                                client.last_reminder_sent = datetime.now().date()
-                                logger.info(f"✅ SYNC: {client.name} received {reminder_type} - REMAINS in queue for future reminders")
+                                try:
+                                    client.last_reminder_sent = datetime.now().date()
+                                    logger.info(f"✅ SYNC: {client.name} received {reminder_type} - REMAINS in queue for future reminders")
+                                except Exception as e:
+                                    logger.warning(f"Could not update last_reminder_sent (field may not exist): {e}")
                                 
                         except Exception as e:
                             logger.error(f"❌ SYNC: Log error for {client.name}: {e}")
