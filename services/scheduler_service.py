@@ -112,54 +112,22 @@ class SchedulerService:
                         logger.error(f"Invalid time format for user {user.id}: {e}")
                         continue
                     
-                    # Check daily reminders - execute if time passed and not run today
-                    last_run = settings.last_morning_run if settings else None
-                    if (current_time >= daily_time and 
-                        (last_run != current_date or last_run is None)):
-                        logger.info(f"Processing daily reminders for user {user.id} (time passed: {current_time_str} >= {settings.morning_reminder_time})")
+                    # Check daily reminders - execute if time passed (NO PROTECTION DURING TEST PHASE)
+                    if current_time >= daily_time:
+                        logger.info(f"🧪 TEST MODE: Processing daily reminders for user {user.id} (time passed: {current_time_str} >= {settings.morning_reminder_time})")
                         try:
-                            future = asyncio.run_coroutine_threadsafe(
-                                self._process_daily_reminders_for_user(user.id), 
-                                self._get_event_loop()
-                            )
-                            future.result(timeout=15)  # Reduced timeout
+                            # CALL SYNC VERSION DIRECTLY - NO MORE ASYNC ISSUES!
+                            self._process_daily_reminders_sync(user.id)
                             
-                            # Update last run date
-                            if settings:
-                                settings.last_morning_run = current_date
-                                session.commit()
-                            logger.info(f"Daily reminders completed for user {user.id}")
+                            logger.info(f"✅ TEST MODE: Daily reminders completed for user {user.id}")
                         except Exception as e:
                             logger.error(f"Error processing daily reminders for user {user.id}: {str(e)}")
                             import traceback
                             logger.error(f"Full traceback: {traceback.format_exc()}")
                     
-                    # Check daily report - execute if time passed and not run today  
-                    try:
-                        report_time_str = settings.daily_report_time if settings.daily_report_time else '08:00'
-                        report_time = datetime.strptime(report_time_str, "%H:%M").time()
-                        last_report_run = settings.last_report_run if settings else None
-                        if (current_time >= report_time and 
-                            (last_report_run != current_date or last_report_run is None)):
-                            logger.info(f"Processing daily report for user {user.id} (time passed: {current_time_str} >= {settings.daily_report_time})")
-                            try:
-                                future = asyncio.run_coroutine_threadsafe(
-                                    self._process_user_notifications_for_user(user.id), 
-                                    self._get_event_loop()
-                                )
-                                future.result(timeout=15)  # Reduced timeout
-                                
-                                # Update last report run date
-                                if settings:
-                                    settings.last_report_run = current_date
-                                    session.commit()
-                                logger.info(f"Daily report completed for user {user.id}")
-                            except Exception as e:
-                                logger.error(f"Error processing daily report for user {user.id}: {str(e)}")
-                                import traceback
-                                logger.error(f"Full traceback: {traceback.format_exc()}")
-                    except ValueError:
-                        logger.error(f"Invalid report time format for user {user.id}")
+                    # Daily report processing disabled during test phase
+                    # (Only focusing on reminder testing for now)
+                    logger.debug(f"🧪 TEST MODE: Daily report processing disabled for user {user.id}")
             
         except Exception as e:
             logger.error(f"Error checking reminder times: {e}")
@@ -595,6 +563,34 @@ class SchedulerService:
                 # Replace variables in template
                 message_content = self._replace_template_variables(template.content, client)
                 
+                # Quick WhatsApp connection check with timeout protection
+                try:
+                    connection_status = asyncio.wait_for(
+                        asyncio.to_thread(whatsapp_service.check_instance_status, user.id),
+                        timeout=2  # Quick check - 2 seconds max
+                    )
+                    connection_status = await connection_status
+                    
+                    if not connection_status.get('connected', False):
+                        logger.warning(f"WhatsApp not connected for user {user.id}, skipping message to {client.name}")
+                        # Log failed message due to disconnection
+                        message_log = MessageLog(
+                            user_id=user.id,
+                            client_id=client.id,
+                            template_type=reminder_type,
+                            recipient_phone=client.phone_number,
+                            message_content=message_content,
+                            sent_at=datetime.now(),
+                            status='failed',
+                            error_message='WhatsApp not connected'
+                        )
+                        session.add(message_log)
+                        continue
+                except asyncio.TimeoutError:
+                    logger.warning(f"Connection check timeout for user {user.id}, trying to send anyway")
+                except Exception as e:
+                    logger.warning(f"Connection check failed for user {user.id}: {e}, trying to send anyway")
+                
                 # Send message
                 result = whatsapp_service.send_message(client.phone_number, message_content, user.id)
                 
@@ -683,6 +679,34 @@ class SchedulerService:
                 # Replace variables in template
                 message_content = self._replace_template_variables(template.content, client)
                 
+                # Quick WhatsApp connection check with timeout protection
+                try:
+                    connection_status = asyncio.wait_for(
+                        asyncio.to_thread(whatsapp_service.check_instance_status, user.id),
+                        timeout=2  # Quick check - 2 seconds max
+                    )
+                    connection_status = await connection_status
+                    
+                    if not connection_status.get('connected', False):
+                        logger.warning(f"WhatsApp not connected for user {user.id}, skipping message to {client.name}")
+                        # Log failed message due to disconnection
+                        message_log = MessageLog(
+                            user_id=user.id,
+                            client_id=client.id,
+                            template_type=reminder_type,
+                            recipient_phone=client.phone_number,
+                            message_content=message_content,
+                            sent_at=datetime.now(),
+                            status='failed',
+                            error_message='WhatsApp not connected'
+                        )
+                        session.add(message_log)
+                        continue
+                except asyncio.TimeoutError:
+                    logger.warning(f"Connection check timeout for user {user.id}, trying to send anyway")
+                except Exception as e:
+                    logger.warning(f"Connection check failed for user {user.id}: {e}, trying to send anyway")
+                
                 # Send message
                 result = whatsapp_service.send_message(client.phone_number, message_content, user.id)
                 
@@ -721,83 +745,343 @@ class SchedulerService:
             logger.error(f"Error sending {reminder_type} reminders: {e}")
 
     async def _process_daily_reminders_for_user(self, user_id):
-        """Process daily reminders for a specific user - sends reminders for all client statuses"""
+        """Process daily reminders - DIRECT SYNC VERSION TO AVOID ASYNC ISSUES"""
+        logger.info(f"🚀 DIRECT: Starting reminder processing for user {user_id}")
+        
         try:
-            from services.database_service import DatabaseService
-            from services.whatsapp_service import whatsapp_service
-            from models import User, Client, MessageTemplate, MessageLog
-            from datetime import date, timedelta
+            # Execute the reminder sending directly in a synchronous way
+            import threading
+            result_container = {"success": False, "error": None}
             
-            db_service = DatabaseService()
+            def direct_send():
+                try:
+                    from services.database_service import DatabaseService  
+                    from services.whatsapp_service import WhatsAppService
+                    from models import Client, User, MessageTemplate, MessageLog
+                    from datetime import date, timedelta, datetime
+                    
+                    db = DatabaseService()
+                    ws = WhatsAppService()
+                    today = date.today()
+                    tomorrow = today + timedelta(days=1)
+                    
+                    logger.info(f"🔍 DIRECT: Looking for clients due {tomorrow}")
+                    
+                    with db.get_session() as session:
+                        # Find tomorrow's clients
+                        clients = session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active', 
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date == tomorrow
+                        ).all()
+                        
+                        logger.info(f"📋 DIRECT: Found {len(clients)} clients for user {user_id}")
+                        
+                        if not clients:
+                            result_container["success"] = True
+                            return
+                            
+                        # Get template
+                        template = session.query(MessageTemplate).filter_by(
+                            user_id=user_id,
+                            template_type='reminder_1_day',
+                            is_active=True
+                        ).first()
+                        
+                        if not template:
+                            logger.warning(f"❌ DIRECT: No template found")
+                            result_container["error"] = "No template"
+                            return
+                        
+                        logger.info(f"📝 DIRECT: Using template: {template.name}")
+                        
+                        # Send to each client
+                        for client in clients:
+                            logger.info(f"📨 DIRECT: Sending to {client.name}")
+                            
+                            # Replace variables
+                            message_content = template.content
+                            variables = {
+                                '{nome}': client.name,
+                                '{plano}': client.plan_name,
+                                '{valor}': f"{client.plan_price:.2f}",
+                                '{vencimento}': client.due_date.strftime('%d/%m/%Y'),
+                                '{servidor}': client.server or 'Não definido',
+                                '{informacoes_extras}': client.other_info or ''
+                            }
+                            
+                            for var, value in variables.items():
+                                message_content = message_content.replace(var, str(value))
+                            
+                            # Send message
+                            try:
+                                result = ws.send_message(client.phone_number, message_content, user_id)
+                                status = 'sent' if result.get('success') else 'failed'
+                                error_msg = result.get('error') if not result.get('success') else None
+                                
+                                logger.info(f"📊 DIRECT: Result for {client.name}: {status}")
+                                
+                            except Exception as e:
+                                status = 'failed'
+                                error_msg = str(e)
+                                logger.error(f"❌ DIRECT: Send failed: {e}")
+                            
+                            # Log the message
+                            message_log = MessageLog(
+                                user_id=user_id,
+                                client_id=client.id,
+                                template_type='reminder_1_day',
+                                recipient_phone=client.phone_number,
+                                message_content=message_content,
+                                sent_at=datetime.now(),
+                                status=status,
+                                error_message=error_msg
+                            )
+                            session.add(message_log)
+                        
+                        session.commit()
+                        result_container["success"] = True
+                        logger.info(f"✅ DIRECT: Completed processing user {user_id}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ DIRECT: Error in thread: {e}")
+                    result_container["error"] = str(e)
             
-            with db_service.get_session() as session:
-                user = session.query(User).filter_by(id=user_id, is_active=True).first()
+            # Execute in thread to avoid async issues
+            thread = threading.Thread(target=direct_send)
+            thread.start()
+            thread.join(timeout=25)  # 25 second timeout
+            
+            if thread.is_alive():
+                logger.error(f"❌ DIRECT: Thread timeout for user {user_id}")
+            elif result_container["success"]:
+                logger.info(f"✅ DIRECT: Success for user {user_id}")
+            elif result_container["error"]:
+                logger.error(f"❌ DIRECT: Error for user {user_id}: {result_container['error']}")
                 
-                if not user:
-                    logger.warning(f"User {user_id} not found or inactive")
+        except Exception as e:
+            logger.error(f"❌ DIRECT: Main error for user {user_id}: {e}")
+
+    def _process_daily_reminders_sync(self, user_id):
+        """COMPLETELY SYNC VERSION - NO ASYNC AT ALL"""
+        logger.info(f"🚀 SYNC: Starting reminder processing for user {user_id}")
+        
+        try:
+            from services.database_service import DatabaseService  
+            from services.whatsapp_service import WhatsAppService
+            from models import Client, User, MessageTemplate, MessageLog
+            from datetime import date, timedelta, datetime
+            from sqlalchemy import func
+            
+            db = DatabaseService()
+            ws = WhatsAppService()
+            today = date.today()
+            tomorrow = today + timedelta(days=1)
+            
+            logger.info(f"🔍 SYNC: Looking for clients due {tomorrow}")
+            
+            with db.get_session() as session:
+                # Get all reminder types and their clients
+                today = date.today()
+                tomorrow = today + timedelta(days=1)
+                day_after_tomorrow = today + timedelta(days=2)
+                
+                # SEQUENTIAL REMINDER SYSTEM: All active clients eligible for reminders
+                reminder_groups = {
+                    'reminder_2_days': session.query(Client).filter(
+                        Client.user_id == user_id,
+                        Client.status == 'active',
+                        Client.auto_reminders_enabled == True,
+                        Client.due_date == day_after_tomorrow
+                    ).all(),
+                    'reminder_1_day': session.query(Client).filter(
+                        Client.user_id == user_id,
+                        Client.status == 'active',
+                        Client.auto_reminders_enabled == True,
+                        Client.due_date == tomorrow
+                    ).all(),
+                    'reminder_due_date': session.query(Client).filter(
+                        Client.user_id == user_id,
+                        Client.status == 'active',
+                        Client.auto_reminders_enabled == True,
+                        Client.due_date == today
+                    ).all(),
+                    'reminder_overdue': session.query(Client).filter(
+                        Client.user_id == user_id,
+                        Client.status == 'active',
+                        Client.auto_reminders_enabled == True,
+                        Client.due_date < today
+                    ).all()
+                }
+                
+                total_clients = sum(len(clients) for clients in reminder_groups.values())
+                logger.info(f"🔄 SYNC: Found {total_clients} clients eligible for SEQUENTIAL reminders for user {user_id}")
+                
+                if total_clients == 0:
+                    logger.info(f"✅ SYNC: No clients eligible for reminders for user {user_id}")
                     return
                 
-                today = date.today()
-                logger.info(f"Processing daily reminders for user {user_id} on {today}")
+                # Process each reminder type
+                for reminder_type, clients in reminder_groups.items():
+                    if not clients:
+                        continue
+                        
+                    logger.info(f"🔔 SYNC: Processing {len(clients)} clients for {reminder_type}")
+                    
+                    # Get template for this reminder type
+                    template = session.query(MessageTemplate).filter_by(
+                        user_id=user_id,
+                        template_type=reminder_type,
+                        is_active=True
+                    ).first()
+                    
+                    if not template:
+                        logger.warning(f"❌ SYNC: No {reminder_type} template found for user {user_id}")
+                        continue
+                    
+                    logger.info(f"📝 SYNC: Using template: {template.name}")
+                    
+                    # Send to each client in this group
+                    for client in clients:
+                        logger.info(f"📨 SYNC: Processing {client.name} (ID: {client.id}) - {reminder_type}")
+                        
+                        # CHECK IF THIS SPECIFIC REMINDER TYPE ALREADY SENT TODAY
+                        today = datetime.now().date()
+                        existing_log = session.query(MessageLog).filter(
+                            MessageLog.user_id == user_id,
+                            MessageLog.client_id == client.id,
+                            MessageLog.template_type == reminder_type,
+                            func.date(MessageLog.sent_at) == today,
+                            MessageLog.status == 'sent'
+                        ).first()
+                        
+                        if existing_log:
+                            logger.info(f"⏩ SYNC: SKIPPING {client.name} - {reminder_type} already sent today")
+                            continue
+                        
+                        # Replace variables for this specific client
+                        message_content = template.content
+                        variables = {
+                            '{nome}': client.name,
+                            '{plano}': client.plan_name,
+                            '{valor}': f"{client.plan_price:.2f}",
+                            '{vencimento}': client.due_date.strftime('%d/%m/%Y'),
+                            '{servidor}': client.server or 'Não definido',
+                            '{informacoes_extras}': client.other_info or ''
+                        }
+                        
+                        for var, value in variables.items():
+                            message_content = message_content.replace(var, str(value))
+                        
+                        logger.info(f"💬 SYNC: Message prepared for {client.name}: {len(message_content)} chars")
+                        
+                        # Send message
+                        try:
+                            logger.info(f"📤 SYNC: Sending WhatsApp to {client.phone_number}")
+                            result = ws.send_message(client.phone_number, message_content, user_id)
+                            status = 'sent' if result.get('success') else 'failed'
+                            error_msg = result.get('error') if not result.get('success') else None
+                            
+                            logger.info(f"📊 SYNC: Result for {client.name}: {status}")
+                            if error_msg:
+                                logger.warning(f"⚠️ SYNC: Error details: {error_msg}")
+                            
+                        except Exception as e:
+                            status = 'failed'
+                            error_msg = str(e)
+                            logger.error(f"❌ SYNC: Send failed for {client.name}: {e}")
+                        
+                        # Log the message
+                        try:
+                            message_log = MessageLog(
+                                user_id=user_id,
+                                client_id=client.id,
+                                template_type=reminder_type,  # Fixed: use correct reminder_type
+                                recipient_phone=client.phone_number,
+                                message_content=message_content,
+                                sent_at=datetime.now(),
+                                status=status,
+                                error_message=error_msg
+                            )
+                            session.add(message_log)
+                            logger.info(f"📝 SYNC: Logged {reminder_type} for {client.name}")
+                            
+                            # UPDATE LAST REMINDER INFO (BUT KEEP IN QUEUE FOR FUTURE REMINDERS!)
+                            if status == 'sent':
+                                client.last_reminder_sent = datetime.now().date()
+                                logger.info(f"✅ SYNC: {client.name} received {reminder_type} - REMAINS in queue for future reminders")
+                                
+                        except Exception as e:
+                            logger.error(f"❌ SYNC: Log error for {client.name}: {e}")
                 
-                # Optimized single query to get all clients with different due dates
-                from sqlalchemy import or_
-                all_clients = session.query(Client).filter(
-                    Client.user_id == user.id,
-                    Client.status == 'active',
-                    Client.auto_reminders_enabled == True,
-                    or_(
-                        Client.due_date == today + timedelta(days=2),  # 2 days
-                        Client.due_date == today + timedelta(days=1),  # 1 day
-                        Client.due_date == today,                      # today
-                        Client.due_date == today - timedelta(days=1)   # overdue
-                    )
-                ).all()
+                session.commit()
+                logger.info(f"✅ SYNC: Completed processing {total_clients} clients for user {user_id}")
                 
-                # Sort clients by category
-                clients_2_days = [c for c in all_clients if c.due_date == today + timedelta(days=2)]
-                clients_1_day = [c for c in all_clients if c.due_date == today + timedelta(days=1)]
-                clients_due_today = [c for c in all_clients if c.due_date == today]
-                clients_overdue = [c for c in all_clients if c.due_date == today - timedelta(days=1)]
-                
-                logger.info(f"Found clients for user {user_id}: 2days={len(clients_2_days)}, 1day={len(clients_1_day)}, today={len(clients_due_today)}, overdue={len(clients_overdue)}")
-                
-                # Send reminder messages for each category with timeout handling
-                if clients_2_days:
-                    await asyncio.wait_for(
-                        self._send_reminders_by_type(session, user, clients_2_days, 'reminder_2_days', whatsapp_service),
-                        timeout=5
-                    )
-                
-                if clients_1_day:
-                    await asyncio.wait_for(
-                        self._send_reminders_by_type(session, user, clients_1_day, 'reminder_1_day', whatsapp_service),
-                        timeout=5
-                    )
-                
-                if clients_due_today:
-                    await asyncio.wait_for(
-                        self._send_reminders_by_type(session, user, clients_due_today, 'reminder_due_date', whatsapp_service),
-                        timeout=5
-                    )
-                
-                if clients_overdue:
-                    await asyncio.wait_for(
-                        self._send_reminders_by_type(session, user, clients_overdue, 'reminder_overdue', whatsapp_service),
-                        timeout=5
-                    )
-                
-                # Send daily sending report after processing all reminders
-                await asyncio.wait_for(
-                    self._send_daily_sending_report(session, user),
-                    timeout=5
-                )
-                
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout processing daily reminders for user {user_id}")
         except Exception as e:
-            logger.error(f"Error processing daily reminders for user {user_id}: {str(e)}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"❌ SYNC: Main error for user {user_id}: {e}")
+            import traceback
+            logger.error(f"SYNC traceback: {traceback.format_exc()}")
+
+    async def _send_simple_reminders(self, session, user, clients, reminder_type):
+        """Simplified reminder sending without complex checks"""
+        from models import MessageTemplate, MessageLog
+        from datetime import datetime
+        from services.whatsapp_service import whatsapp_service
+        
+        logger.info(f"📤 Sending {reminder_type} to {len(clients)} clients")
+        
+        try:
+            # Get template
+            template = session.query(MessageTemplate).filter_by(
+                user_id=user.id,
+                template_type=reminder_type,
+                is_active=True
+            ).first()
+            
+            if not template:
+                logger.warning(f"❌ No template for {reminder_type}")
+                return
+                
+            logger.info(f"📝 Using template: {template.name}")
+            
+            for client in clients:
+                logger.info(f"📨 Sending to {client.name} ({client.phone_number})")
+                
+                # Replace template variables
+                message_content = self._replace_template_variables(template.content, client)
+                
+                # Try to send message (simplified, no connection checks)
+                try:
+                    result = whatsapp_service.send_message(client.phone_number, message_content, user.id)
+                    status = 'sent' if result.get('success') else 'failed'
+                    error_msg = result.get('error') if not result.get('success') else None
+                    
+                    logger.info(f"📊 Result for {client.name}: {status}")
+                    
+                except Exception as e:
+                    status = 'failed'
+                    error_msg = str(e)
+                    logger.error(f"❌ Send failed for {client.name}: {e}")
+                
+                # Log the attempt
+                message_log = MessageLog(
+                    user_id=user.id,
+                    client_id=client.id,
+                    template_type=reminder_type,
+                    recipient_phone=client.phone_number,
+                    message_content=message_content,
+                    sent_at=datetime.now(),
+                    status=status,
+                    error_message=error_msg
+                )
+                session.add(message_log)
+            
+            session.commit()
+            logger.info(f"✅ Completed sending {reminder_type} reminders")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in _send_simple_reminders: {e}")
 
 
     async def _process_user_notifications_for_user(self, user_id):

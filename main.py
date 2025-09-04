@@ -1275,6 +1275,7 @@ async def save_client_to_database(update: Update, context: ContextTypes.DEFAULT_
                 phone_number=client_phone,
                 plan_name=client_plan,
                 plan_price=client_price,
+                reminder_status='pending',  # AUTO-ENTER REMINDER QUEUE!
                 server=client_server,
                 other_info=client_other_info,
                 due_date=due_date,
@@ -2726,7 +2727,8 @@ async def send_renewal_message_callback(update: Update, context: ContextTypes.DE
                 message_log = MessageLog(
                     user_id=db_user.id,
                     client_id=client.id,
-                    template_id=template.id,
+                    template_type=template.template_type,
+                    recipient_phone=client.phone_number,
                     message_content=message_content,
                     sent_at=datetime.now(),
                     status='sent'
