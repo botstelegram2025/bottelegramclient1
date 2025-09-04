@@ -69,8 +69,7 @@ def normalize_brazilian_phone(phone_number: str) -> str:
 
 # Import configurations and services
 from config import Config
-from services.database_service import DatabaseService
-db_service = DatabaseService()
+from services.database_service import db_service
 from services.scheduler_service import scheduler_service
 from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
@@ -2720,9 +2719,9 @@ async def send_renewal_message_callback(update: Update, context: ContextTypes.DE
             message_content = replace_template_variables(template.content, client)
             
             # Send via WhatsApp
-            success = await whatsapp_service.send_message(client.phone_number, message_content, db_user.id)
+            result = whatsapp_service.send_message(client.phone_number, message_content, db_user.id)
             
-            if success:
+            if result.get('success'):
                 # Log message
                 message_log = MessageLog(
                     user_id=db_user.id,
@@ -4210,9 +4209,9 @@ async def send_template_to_client_callback(update: Update, context: ContextTypes
             # Send WhatsApp message
             from services.whatsapp_service import whatsapp_service
             
-            success = whatsapp_service.send_message(client.phone_number, message_content, db_user.id)
+            result = whatsapp_service.send_message(client.phone_number, message_content, db_user.id)
             
-            if success:
+            if result.get('success'):
                 # Log the message
                 message_log = MessageLog(
                     user_id=db_user.id,
@@ -5035,6 +5034,7 @@ def main():
         application.add_handler(CallbackQueryHandler(edit_client_callback, pattern="^edit_\\d+$"))
         application.add_handler(CallbackQueryHandler(renew_client_callback, pattern="^renew_\\d+$"))
         application.add_handler(CallbackQueryHandler(renew_auto_callback, pattern="^renew_auto_\\d+$"))
+        application.add_handler(CallbackQueryHandler(send_renewal_message_callback, pattern="^send_renewal_message_\\d+$"))
         application.add_handler(CallbackQueryHandler(message_client_callback, pattern="^message_\\d+$"))
         
         # Template management callbacks
@@ -5570,11 +5570,8 @@ async def manual_sync_queue(user_id: int):
                     message_content = message_content.replace('{valor}', f'R$ {client.monthly_value:.2f}' if client.monthly_value else 'R$ 0,00')
                     message_content = message_content.replace('{vencimento}', client.due_date.strftime('%d/%m/%Y') if client.due_date else 'Não definido')
                     
-                    # Send message with timeout
-                    result_send = await asyncio.wait_for(
-                        whatsapp_service.send_message(user.id, client.phone_number, message_content),
-                        timeout=5
-                    )
+                    # Send message without timeout (synchronous call)
+                    result_send = whatsapp_service.send_message(client.phone_number, message_content, user.id)
                     
                     # Log the message
                     status = 'sent' if result_send.get('success') else 'failed'
