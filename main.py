@@ -69,7 +69,8 @@ def normalize_brazilian_phone(phone_number: str) -> str:
 
 # Import configurations and services
 from config import Config
-from services.database_service import db_service
+from services.database_service import DatabaseService
+db_service = DatabaseService()
 from services.scheduler_service import scheduler_service
 from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
