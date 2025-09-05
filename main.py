@@ -117,7 +117,7 @@ def get_main_keyboard(db_user=None):
     keyboard = [
         [KeyboardButton("👥 Clientes"), KeyboardButton("📊 Dashboard")],
         [KeyboardButton("📋 Ver Templates"), KeyboardButton("⏰ Horários")],
-        [KeyboardButton("💳 Assinatura")],
+        [KeyboardButton("💳 Assinatura"), KeyboardButton("🚀 Forçar Hoje")],
         [KeyboardButton("📱 WhatsApp"), KeyboardButton("❓ Ajuda")]
     ]
     
@@ -362,7 +362,18 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     clean_phone = normalized_phone
     
     try:
+        logger.info(f"Starting user registration for telegram_id: {user.id}")
+        
         with db_service.get_session() as session:
+            # Check if user already exists
+            existing_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            if existing_user:
+                logger.warning(f"User {user.id} already exists")
+                await update.message.reply_text("❌ Usuário já cadastrado. Use /start para acessar o menu.")
+                return ConversationHandler.END
+            
+            logger.info(f"Creating new user record...")
+            
             # Create new user with 7-day trial
             new_user = User(
                 telegram_id=str(user.id),
@@ -377,14 +388,25 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             
             session.add(new_user)
+            session.flush()  # Get the ID without committing
+            
+            logger.info(f"User record created with ID: {new_user.id}")
+            
+            # Commit user creation first
             session.commit()
+            
+            logger.info(f"User committed successfully, creating templates...")
             
             # Create default templates for new user
             try:
-                await create_default_templates_in_db(new_user.id)
-                logger.info(f"Default templates created for user {new_user.id}")
+                template_result = await create_default_templates_in_db(new_user.id)
+                if template_result:
+                    logger.info(f"Default templates created successfully for user {new_user.id}")
+                else:
+                    logger.warning(f"Template creation returned False for user {new_user.id}")
             except Exception as e:
-                logger.error(f"Error creating default templates for new user: {e}")
+                logger.error(f"Error creating default templates for new user {new_user.id}: {e}")
+                # Don't fail registration if templates fail
             
             success_message = f"""
 ✅ **Cadastro realizado com sucesso!**
@@ -400,14 +422,79 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 Use o teclado abaixo para começar:
 """
             
+            logger.info(f"Registration completed successfully for user {new_user.id}")
+            
             await update.message.reply_text(success_message, parse_mode='Markdown')
             await show_main_menu(update, context)
             return ConversationHandler.END
             
     except Exception as e:
-        logger.error(f"Error saving user: {e}")
-        await update.message.reply_text("❌ Erro ao cadastrar. Tente novamente.")
+        logger.error(f"CRITICAL ERROR during user registration for {user.id}: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error details: {str(e)}")
+        
+        # Try to provide more specific error message
+        error_msg = "❌ Erro ao cadastrar. "
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            error_msg += "Usuário já existe. Use /start para acessar."
+        else:
+            error_msg += "Tente novamente em alguns segundos."
+            
+        await update.message.reply_text(error_msg)
         return WAITING_FOR_PHONE
+
+async def force_process_reminders_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force process reminders for today - ADMIN FUNCTION"""
+    if not update.effective_user:
+        return
+        
+    user = update.effective_user
+    
+    try:
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user or not db_user.is_active:
+                await update.message.reply_text("❌ Conta inativa.")
+                return
+            
+            # Reset user's morning time to 09:00 if needed
+            from models import UserScheduleSettings
+            schedule_settings = session.query(UserScheduleSettings).filter_by(
+                user_id=db_user.id
+            ).first()
+            
+            if not schedule_settings:
+                schedule_settings = UserScheduleSettings(
+                    user_id=db_user.id,
+                    morning_reminder_time='09:00',
+                    daily_report_time='08:00',
+                    auto_send_enabled=True
+                )
+                session.add(schedule_settings)
+            else:
+                schedule_settings.morning_reminder_time = '09:00'
+                schedule_settings.daily_report_time = '08:00'
+                schedule_settings.auto_send_enabled = True
+            
+            session.commit()
+            
+            # Force process reminders now
+            from services.scheduler_service import scheduler_service
+            scheduler_service._process_daily_reminders_sync(db_user.id)
+            
+            await update.message.reply_text("""✅ **Lembretes Processados!**
+
+🔧 **Ações realizadas:**
+• Horário matinal definido para: **09:00**
+• Relatório diário definido para: **08:00** 
+• Processamento forçado de lembretes de hoje
+
+📨 Verifique se os lembretes foram enviados!""", parse_mode='Markdown')
+            
+    except Exception as e:
+        logger.error(f"Error forcing reminder processing: {e}")
+        await update.message.reply_text("❌ Erro ao processar lembretes. Tente novamente.")
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show main menu to user"""
@@ -1864,6 +1951,8 @@ async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_
     elif text == "🚀 PAGAMENTO ANTECIPADO":
         logger.info(f"🚀 PAGAMENTO ANTECIPADO button pressed by user {update.effective_user.id}")
         await early_payment_message(update, context)
+    elif text == "🚀 Forçar Hoje":
+        await force_process_reminders_today(update, context)
     else:
         # Log unknown button presses
         logger.warning(f"handle_keyboard_buttons: Unknown button pressed: '{text}' by user {update.effective_user.id if update.effective_user else 'None'}")
