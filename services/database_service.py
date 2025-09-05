@@ -61,6 +61,21 @@ class DatabaseService:
                         ADD COLUMN last_reminder_sent DATE
                     """))
                     connection.commit()
+                
+                # Check if is_default column exists in message_templates table
+                result = connection.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='message_templates' AND column_name='is_default'
+                """))
+                
+                if not result.fetchone():
+                    logger.info("Adding is_default column to message_templates table")
+                    connection.execute(text("""
+                        ALTER TABLE message_templates 
+                        ADD COLUMN is_default BOOLEAN DEFAULT FALSE
+                    """))
+                    connection.commit()
                     
                 logger.info("Database migration completed successfully")
                 

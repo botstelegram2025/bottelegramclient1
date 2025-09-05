@@ -30,6 +30,9 @@ class SchedulerService:
         # Schedule payment verification every 2 minutes
         schedule.every(2).minutes.do(self._check_pending_payments)
         
+        # Schedule automatic daily reset at 5:00 AM São Paulo time
+        schedule.every().day.at("05:00").do(self._auto_daily_reset)
+        
         # Start the scheduler thread
         self.thread = threading.Thread(target=self._run_scheduler, daemon=True)
         self.thread.start()
@@ -184,6 +187,40 @@ class SchedulerService:
         finally:
             if self.loop:
                 self.loop.close()
+
+    def _auto_daily_reset(self):
+        """Automatic daily reset at 5:00 AM São Paulo time to clear 'already sent today' flags"""
+        try:
+            # Use Brazil timezone (America/Sao_Paulo)
+            brazil_tz = pytz.timezone('America/Sao_Paulo')
+            current_datetime = datetime.now(brazil_tz)
+            current_time_str = current_datetime.strftime("%H:%M")
+            
+            logger.info(f"🔄 AUTO RESET: Starting daily reset at {current_time_str} (São Paulo time)")
+            
+            from services.database_service import DatabaseService
+            from models import Client
+            
+            db_service = DatabaseService()
+            
+            with db_service.get_session() as session:
+                # Reset last_reminder_sent for ALL clients to allow fresh daily processing
+                yesterday = datetime.now(brazil_tz).date() - timedelta(days=1)
+                
+                # Update all active clients to have yesterday's date so they can receive reminders today
+                updated_count = session.query(Client).filter_by(status='active').update({
+                    'last_reminder_sent': yesterday
+                })
+                
+                session.commit()
+                
+                logger.info(f"✅ AUTO RESET: Reset reminder flags for {updated_count} active clients")
+                logger.info(f"🔄 AUTO RESET: Daily reset completed successfully at {current_time_str}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error in auto daily reset: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _check_pending_payments(self):
         """Check pending payments and process approved ones automatically"""
