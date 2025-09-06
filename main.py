@@ -3336,10 +3336,9 @@ async def handle_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
         return ConversationHandler.END
     
-    # Validate phone number using modern normalization
-    normalized_phone = normalize_brazilian_phone(phone_number)
-    if len(normalized_phone) < 10 or len(normalized_phone) > 11:
-        await update.message.reply_text("❌ Número inválido. Digite apenas números com DDD (ex: 11999999999):")
+    # Accept phone number exactly as user typed (no normalization/formatting)
+    if len(phone_number) < 8:
+        await update.message.reply_text("❌ Número muito curto. Digite o telefone:")
         return EDIT_WAITING_PHONE
     
     try:
@@ -3352,13 +3351,13 @@ async def handle_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if client:
                 old_phone = client.phone_number
-                client.phone_number = normalized_phone
+                client.phone_number = phone_number  # Save exactly as user typed
                 session.commit()
                 
                 await update.message.reply_text(
                     f"✅ Telefone atualizado com sucesso!\n\n"
                     f"**Antes:** {old_phone}\n"
-                    f"**Agora:** {normalized_phone}",
+                    f"**Agora:** {phone_number}",
                     parse_mode='Markdown',
                     reply_markup=get_client_keyboard()
                 )
