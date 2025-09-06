@@ -5,6 +5,7 @@ const cors = require('cors');
 const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const { Client } = require('pg');
 
 const app = express();
 app.use(cors());
@@ -17,6 +18,100 @@ console.log(`🌍 Environment: ${isRailway ? 'Railway' : 'Local'}`);
 if (isRailway) {
     console.log('⚡ Railway environment detected - optimizing for cloud deployment');
 }
+
+// Database connection for persistent sessions
+let pgClient = null;
+const connectToDatabase = async () => {
+    if (pgClient) return pgClient;
+    
+    pgClient = new Client({
+        connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/telegram_bot',
+        ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    });
+    
+    try {
+        await pgClient.connect();
+        console.log('🐘 Connected to PostgreSQL for session persistence');
+        return pgClient;
+    } catch (error) {
+        console.error('❌ Failed to connect to PostgreSQL:', error);
+        pgClient = null;
+        return null;
+    }
+};
+
+// Save session to database
+const saveSessionToDatabase = async (userId, sessionData) => {
+    try {
+        const client = await connectToDatabase();
+        if (!client) return false;
+
+        const sessionJson = JSON.stringify(sessionData);
+        
+        await client.query(`
+            INSERT INTO whatsapp_sessions (user_id, session_data, is_connected, connection_status, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (user_id) 
+            DO UPDATE SET 
+                session_data = $2,
+                is_connected = $3,
+                connection_status = $4,
+                updated_at = NOW()
+        `, [userId, sessionJson, sessionData.connected || false, sessionData.status || 'disconnected']);
+        
+        console.log(`💾 Session saved to database for user ${userId}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Error saving session to database:', error);
+        return false;
+    }
+};
+
+// Load session from database
+const loadSessionFromDatabase = async (userId) => {
+    try {
+        const client = await connectToDatabase();
+        if (!client) return null;
+
+        const result = await client.query(
+            'SELECT session_data, is_connected, connection_status FROM whatsapp_sessions WHERE user_id = $1',
+            [userId]
+        );
+        
+        if (result.rows.length > 0) {
+            const sessionData = JSON.parse(result.rows[0].session_data || '{}');
+            sessionData.connected = result.rows[0].is_connected;
+            sessionData.status = result.rows[0].connection_status;
+            console.log(`📥 Session loaded from database for user ${userId}`);
+            return sessionData;
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('❌ Error loading session from database:', error);
+        return null;
+    }
+};
+
+// Update session status in database
+const updateSessionStatus = async (userId, isConnected, status = 'connected') => {
+    try {
+        const client = await connectToDatabase();
+        if (!client) return false;
+
+        await client.query(`
+            UPDATE whatsapp_sessions 
+            SET is_connected = $2, connection_status = $3, last_activity = NOW(), updated_at = NOW()
+            WHERE user_id = $1
+        `, [userId, isConnected, status]);
+        
+        console.log(`🔄 Session status updated for user ${userId}: ${status}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Error updating session status:', error);
+        return false;
+    }
+};
 
 // Map para armazenar sessões de cada usuário
 const userSessions = new Map();
@@ -67,6 +162,43 @@ class UserWhatsAppSession {
         this.maxReconnectAttempts = 5;
         this.pairingCode = null; // Store pairing code
         this.phoneNumber = null; // Store phone number for pairing
+        
+        // Load session from database on initialization
+        this.loadPersistedSession();
+    }
+    
+    async loadPersistedSession() {
+        try {
+            const sessionData = await loadSessionFromDatabase(this.userId);
+            if (sessionData) {
+                this.isConnected = sessionData.connected || false;
+                this.connectionState = sessionData.status || 'disconnected';
+                console.log(`🔄 Restored session state for user ${this.userId}: ${this.connectionState}`);
+                
+                // If was connected, try to restore connection
+                if (this.isConnected && this.connectionState === 'connected') {
+                    console.log(`🔄 Attempting to restore active connection for user ${this.userId}...`);
+                    // Start connection restoration in background
+                    setTimeout(() => this.start(false), 2000);
+                }
+            }
+        } catch (error) {
+            console.error(`❌ Error loading persisted session for user ${this.userId}:`, error);
+        }
+    }
+    
+    async saveSessionState() {
+        try {
+            const sessionData = {
+                connected: this.isConnected,
+                status: this.connectionState,
+                timestamp: new Date().toISOString()
+            };
+            await saveSessionToDatabase(this.userId, sessionData);
+            await updateSessionStatus(this.userId, this.isConnected, this.connectionState);
+        } catch (error) {
+            console.error(`❌ Error saving session state for user ${this.userId}:`, error);
+        }
     }
     
     async start(forceNew = false) {
@@ -171,6 +303,9 @@ class UserWhatsAppSession {
                     this.isConnected = false;
                     this.connectionState = 'disconnected';
                     
+                    // Save disconnection state to database
+                    await this.saveSessionState();
+                    
                     // Preserve QR data for longer to avoid unnecessary regeneration
                     if (statusCode !== 408 && statusCode !== 428) {
                         this.qrCodeData = null;
@@ -224,6 +359,9 @@ class UserWhatsAppSession {
                     this.qrCodeData = null;
                     this.pairingCode = null; // Clear pairing code when connected
                     this.reconnectAttempts = 0; // Reset reconnect attempts
+                    
+                    // Save connection state to database
+                    await this.saveSessionState();
                     
                     // Clear any reconnection timeouts
                     if (this.reconnectTimeout) {
@@ -330,6 +468,9 @@ class UserWhatsAppSession {
         this.qrCodeData = null;
         this.pairingCode = null;
         this.sock = null;
+        
+        // Save disconnection state to database
+        await this.saveSessionState();
     }
     
     startHeartbeat() {
@@ -775,6 +916,39 @@ app.post('/restore/:userId', async (req, res) => {
     }
 });
 
+// Startup recovery system - restore all persistent sessions from database
+const restorePersistedSessions = async () => {
+    try {
+        const client = await connectToDatabase();
+        if (!client) return;
+
+        const result = await client.query(
+            'SELECT user_id, is_connected, connection_status FROM whatsapp_sessions WHERE is_connected = true OR connection_status = \'connected\''
+        );
+
+        console.log(`🔄 Found ${result.rows.length} sessions to restore from database`);
+        
+        for (const row of result.rows) {
+            const userId = row.user_id.toString();
+            
+            if (!userSessions.has(userId)) {
+                console.log(`🔄 Restoring session for user ${userId}...`);
+                const session = new UserWhatsAppSession(userId);
+                userSessions.set(userId, session);
+                
+                // Try to restore connection after a brief delay to avoid overwhelming the system
+                setTimeout(() => {
+                    session.start(false).catch(error => {
+                        console.error(`❌ Failed to restore session for user ${userId}:`, error);
+                    });
+                }, Math.random() * 5000); // Random delay up to 5 seconds
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error restoring persisted sessions:', error);
+    }
+};
+
 // Auto-recovery system - check sessions every 5 minutes
 setInterval(() => {
     console.log(`🔍 Health check: ${userSessions.size} active sessions`);
@@ -813,5 +987,12 @@ const PORT = 3001;
 app.listen(PORT, () => {
     console.log(`🚀 Servidor Baileys Multi-User rodando na porta ${PORT}`);
     console.log(`✅ Sistema de recuperação automática ativo`);
-    console.log(`💾 Sessões persistentes em ./sessions/`);
+    console.log(`💾 Sessões persistentes no PostgreSQL`);
+    console.log(`📱 Use /qr/{userId} para gerar QR code`);
+    console.log(`💬 Use POST /send/{userId} para enviar mensagens`);
+    console.log(`📊 Use /status/{userId} para ver status da conexão`);
+    
+    // Restore persistent sessions on startup
+    console.log('🔄 Restoring persistent sessions from database...');
+    setTimeout(restorePersistedSessions, 3000); // Wait 3 seconds before starting recovery
 });

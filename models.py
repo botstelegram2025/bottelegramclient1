@@ -29,6 +29,7 @@ class User(Base):
     subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     message_logs = relationship("MessageLog", back_populates="user", cascade="all, delete-orphan")
     message_templates = relationship("MessageTemplate", back_populates="user", cascade="all, delete-orphan")
+    whatsapp_session = relationship("WhatsAppSession", back_populates="user", uselist=False)
 
 class Client(Base):
     __tablename__ = 'clients'
@@ -133,3 +134,22 @@ class UserScheduleSettings(Base):
     
     # Relationships
     user = relationship("User", backref="schedule_settings")
+
+class WhatsAppSession(Base):
+    __tablename__ = 'whatsapp_sessions'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, unique=True)
+    session_data = Column(Text, nullable=True)  # JSON string with complete session state
+    creds = Column(Text, nullable=True)  # Authentication credentials
+    keys = Column(Text, nullable=True)  # Session keys  
+    phone_number = Column(String(20), nullable=True)
+    is_connected = Column(Boolean, default=False)
+    connection_status = Column(String(20), default='disconnected')  # disconnected, connecting, connected, failed
+    last_activity = Column(DateTime, nullable=True)
+    last_qr_code = Column(Text, nullable=True)  # Store QR for recovery
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User", back_populates="whatsapp_session")
