@@ -243,8 +243,8 @@ class UserWhatsAppSession {
             this.sock = makeWASocket({
                 auth: state,
                 printQRInTerminal: false,
-                defaultQueryTimeoutMs: 180000, // Railway optimized timeout
-                connectTimeoutMs: 180000, // Railway needs longer timeout
+                defaultQueryTimeoutMs: 300000, // Extended Railway timeout  
+                connectTimeoutMs: 300000, // Railway needs longer timeout
                 browser: [`User_${this.userId}`, 'Chrome', '22.04.4'], // Unique browser per user
                 syncFullHistory: false,
                 markOnlineOnConnect: true, // Keep connection visible
@@ -489,16 +489,14 @@ class UserWhatsAppSession {
                     // Simple ping to keep connection alive
                     console.log(`💓 Heartbeat for user ${this.userId} (failures: ${this.heartbeatFailures})`);
                     
+                    // Railway-optimized simple heartbeat 
                     await Promise.race([
-                        this.sock.query({
-                            tag: 'iq',
-                            attrs: {
-                                type: 'get',
-                                xmlns: 'w:profile:picture'
-                            }
-                        }),
+                        // Use simpler check that's more reliable on cloud
+                        this.sock && this.sock.ws && this.sock.ws.readyState === 1 
+                            ? Promise.resolve('connected')
+                            : Promise.reject(new Error('Socket not ready')),
                         new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('Heartbeat timeout')), 15000)
+                            setTimeout(() => reject(new Error('Heartbeat timeout')), 30000) // Railway needs longer timeout
                         )
                     ]);
                     
@@ -526,22 +524,24 @@ class UserWhatsAppSession {
                         // Reset failure count
                         this.heartbeatFailures = 0;
                         
-                        // Only auto-reconnect for serious connection errors
-                        if (error.message.includes('Connection Closed') || error.message.includes('closed')) {
-                            console.log(`🔄 Connection lost for user ${this.userId}, initiating auto-reconnect...`);
-                            setTimeout(async () => {
-                                try {
-                                    console.log(`🔄 Auto-reconnecting user ${this.userId} after connection loss...`);
-                                    await this.start(false); // Reconnect without forcing new QR
-                                } catch (reconnectError) {
-                                    console.log(`❌ Auto-reconnect failed for user ${this.userId}:`, reconnectError.message);
-                                }
-                            }, 10000); // Wait 10 seconds before reconnecting
-                        }
+                        // Auto-reconnect for any heartbeat failure in Railway
+                        console.log(`🔄 Heartbeat failed for user ${this.userId}, initiating auto-recovery...`);
+                        
+                        // Save disconnection state
+                        await this.saveSessionState();
+                        
+                        setTimeout(async () => {
+                            try {
+                                console.log(`🔄 Auto-reconnecting user ${this.userId} after heartbeat failure...`);
+                                await this.start(false); // Reconnect without forcing new QR
+                            } catch (reconnectError) {
+                                console.log(`❌ Auto-reconnect failed for user ${this.userId}:`, reconnectError.message);
+                            }
+                        }, 15000); // Wait 15 seconds before reconnecting in Railway
                     }
                 }
             }
-        }, 90000); // Every 90 seconds
+        }, 120000); // Every 2 minutes for Railway stability
     }
     
     async reconnect() {
@@ -949,22 +949,64 @@ const restorePersistedSessions = async () => {
     }
 };
 
-// Auto-recovery system - check sessions every 5 minutes
-setInterval(() => {
+// Enhanced auto-recovery system for Railway - check sessions every 3 minutes
+setInterval(async () => {
     console.log(`🔍 Health check: ${userSessions.size} active sessions`);
     
+    // Check database for sessions that should be recovered
+    try {
+        const client = await connectToDatabase();
+        if (client) {
+            const result = await client.query(
+                'SELECT user_id FROM whatsapp_sessions WHERE is_connected = true AND connection_status = \'connected\''
+            );
+            
+            for (const row of result.rows) {
+                const userId = row.user_id.toString();
+                const session = userSessions.get(userId);
+                
+                if (!session) {
+                    console.log(`🔄 Found orphaned database session for user ${userId}, creating session...`);
+                    const newSession = new UserWhatsAppSession(userId);
+                    userSessions.set(userId, newSession);
+                    
+                    setTimeout(() => {
+                        newSession.start(false).catch(error => {
+                            console.error(`❌ Failed to recover orphaned session for user ${userId}:`, error);
+                        });
+                    }, Math.random() * 3000);
+                } else if (!session.isConnected) {
+                    console.log(`🔄 Database shows user ${userId} should be connected, attempting recovery...`);
+                    const authPath = path.join(__dirname, 'sessions', session.authFolder);
+                    const hasValidSession = fs.existsSync(authPath) && fs.existsSync(path.join(authPath, 'creds.json'));
+                    
+                    if (hasValidSession && !session.reconnectTimeout) {
+                        session.start(false).catch(error => {
+                            console.error(`❌ Failed to recover session for user ${userId}:`, error);
+                        });
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error in health check:', error);
+    }
+    
+    // Also check existing sessions
     userSessions.forEach((session, userId) => {
         if (!session.isConnected && session.connectionState === 'disconnected') {
             const authPath = path.join(__dirname, 'sessions', session.authFolder);
             const hasValidSession = fs.existsSync(authPath) && fs.existsSync(path.join(authPath, 'creds.json'));
             
             if (hasValidSession && !session.reconnectTimeout) {
-                console.log(`🔄 Auto-recovering session for user ${userId}...`);
-                session.start(false);
+                console.log(`🔄 Auto-recovering disconnected session for user ${userId}...`);
+                session.start(false).catch(error => {
+                    console.error(`❌ Auto-recovery failed for user ${userId}:`, error);
+                });
             }
         }
     });
-}, 300000); // 5 minutes
+}, 180000); // 3 minutes for Railway
 
 // Graceful shutdown
 process.on('SIGINT', () => {
