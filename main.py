@@ -613,21 +613,111 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Revenue still to be collected
             revenue_pending = monthly_revenue_total - revenue_paid
             
+            # Get overdue clients (vencidos)
+            overdue_clients = session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.due_date < today
+            ).count()
+            overdue_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.due_date < today
+            ).all())
+            
+            # Get clients due today
+            due_today = session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.due_date == today
+            ).count()
+            due_today_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.due_date == today
+            ).all())
+            
+            # Get clients paid in last 30 days (renovados)
+            from datetime import datetime
+            thirty_days_ago = today - timedelta(days=30)
+            clients_renewed = session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.last_payment_date >= thirty_days_ago,
+                Client.last_payment_date <= today
+            ).count()
+            renewal_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.last_payment_date >= thirty_days_ago,
+                Client.last_payment_date <= today
+            ).all())
+            
+            # Get upcoming clients (next 7 days)
+            upcoming_clients = session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.due_date > today,
+                Client.due_date <= today + timedelta(days=7)
+            ).count()
+            upcoming_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.due_date > today,
+                Client.due_date <= today + timedelta(days=7)
+            ).all())
+            
+            # Annual statistics
+            year_start = date(current_year, 1, 1)
+            annual_paid = session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.last_payment_date >= year_start,
+                Client.last_payment_date <= today
+            ).count()
+            annual_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active',
+                Client.last_payment_date >= year_start,
+                Client.last_payment_date <= today
+            ).all())
+            
+            # Total potential annual revenue
+            total_annual_potential = sum(client.plan_price * 12 if client.plan_price else 0 for client in session.query(Client).filter(
+                Client.user_id == db_user.id,
+                Client.status == 'active'
+            ).all())
+            
             dashboard_text = f"""
-📊 **Dashboard - Visão Geral**
+📊 **Dashboard - Gestão Financeira**
 
-👥 **Clientes:**
-• Total: {total_clients}
-• Ativos: {active_clients}
-• Inativos: {total_clients - active_clients}
+👥 **Resumo Geral:**
+• Total: {total_clients} clientes
+• Ativos: {active_clients} | Inativos: {total_clients - active_clients}
 
-💰 **Mês Atual ({month_start.strftime('%m/%Y')}):**
+💰 **Status de Pagamento:**
+✅ **PAGOS (Renovados - 30 dias):** {clients_renewed} 
+   💵 Recebido: R$ {renewal_revenue:.2f}
+
+⏰ **VENCEM HOJE:** {due_today} 
+   💰 A receber: R$ {due_today_revenue:.2f}
+
+🔔 **PRÓXIMOS 7 DIAS:** {upcoming_clients}
+   💰 A receber: R$ {upcoming_revenue:.2f}
+
+❌ **VENCIDOS:** {overdue_clients}
+   💸 Em atraso: R$ {overdue_revenue:.2f}
+
+📈 **Resumo Financeiro:**
+**Mês Atual ({month_start.strftime('%m/%Y')}):**
 • 📈 Pagos: {clients_paid} (R$ {revenue_paid:.2f})
 • 📋 A Pagar: {clients_to_pay - clients_paid} (R$ {revenue_pending:.2f})
-• 💵 Faturamento Total: R$ {monthly_revenue_total:.2f}
+• 💵 **Total Mensal**: R$ {monthly_revenue_total:.2f}
 
-⏰ **Vencimentos:**
-• Próximos 7 dias: {expiring_soon}
+**Ano {current_year}:**
+• 💰 Pagamentos recebidos: {annual_paid}
+• 🏆 Receita anual: R$ {annual_revenue:.2f}
+• 🎯 Potencial anual: R$ {total_annual_potential:.2f}
 
 📱 **WhatsApp:**
 • Status: {"✅ Conectado" if whatsapp_service.check_instance_status(db_user.id).get('connected') else "❌ Desconectado"}
