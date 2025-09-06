@@ -352,7 +352,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Validate and normalize phone number
     normalized_phone = normalize_brazilian_phone(phone_number)
-    if len(normalized_phone) != 10:
+    if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text(
             "❌ Número inválido. Digite apenas números com DDD.\n**Exemplo:** 11999999999",
             parse_mode='Markdown'
@@ -598,16 +598,16 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Calculate total revenue for the month (all clients due)
             monthly_revenue_total = sum(client.plan_price or 0 for client in clients_due_query.all())
             
-            # Clients that already paid this month (due date passed)
+            # Clients that already paid this month (payment date within this month)
             clients_paid_query = session.query(Client).filter(
                 Client.user_id == db_user.id,
                 Client.status == 'active',
-                Client.due_date >= month_start,
-                Client.due_date < today  # Already passed due date (paid)
+                Client.last_payment_date >= month_start,
+                Client.last_payment_date <= month_end
             )
             clients_paid = clients_paid_query.count()
             
-            # Calculate revenue from clients who already paid
+            # Calculate revenue from clients who already paid this month
             revenue_paid = sum(client.plan_price or 0 for client in clients_paid_query.all())
             
             # Revenue still to be collected
@@ -970,7 +970,7 @@ async def handle_client_phone(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Validate and normalize phone number
     normalized_phone = normalize_brazilian_phone(phone_number)
-    if len(normalized_phone) != 10:
+    if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text(
             "❌ Número inválido. Digite apenas números com DDD.\n**Exemplo:** 11999999999",
             reply_markup=get_add_client_phone_keyboard(),
@@ -2965,6 +2965,7 @@ async def renew_auto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             client.due_date = new_due_date
             client.status = 'active'  # Reactivate if inactive
+            client.last_payment_date = date.today()  # Record payment date
             session.commit()
             
             # Store client info for message sending
@@ -3053,6 +3054,7 @@ async def handle_renew_custom_date(update: Update, context: ContextTypes.DEFAULT
                 old_due_date = client.due_date
                 client.due_date = new_due_date
                 client.status = 'active'  # Reactivate if inactive
+                client.last_payment_date = date.today()  # Record payment date
                 session.commit()
                 
                 # Store client info for message sending
@@ -3334,9 +3336,9 @@ async def handle_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
         return ConversationHandler.END
     
-    # Validate phone number
-    clean_phone = ''.join(filter(str.isdigit, phone_number))
-    if len(clean_phone) < 10 or len(clean_phone) > 11:
+    # Validate phone number using modern normalization
+    normalized_phone = normalize_brazilian_phone(phone_number)
+    if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text("❌ Número inválido. Digite apenas números com DDD (ex: 11999999999):")
         return EDIT_WAITING_PHONE
     
@@ -3350,7 +3352,7 @@ async def handle_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if client:
                 old_phone = client.phone_number
-                client.phone_number = clean_phone
+                client.phone_number = normalized_phone
                 session.commit()
                 
                 await update.message.reply_text(
@@ -3675,16 +3677,16 @@ async def dashboard_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Calculate total revenue for the month (all clients due)
             monthly_revenue_total = sum(client.plan_price or 0 for client in clients_due_query.all())
             
-            # Clients that already paid this month (due date passed)
+            # Clients that already paid this month (payment date within this month)
             clients_paid_query = session.query(Client).filter(
                 Client.user_id == db_user.id,
                 Client.status == 'active',
-                Client.due_date >= month_start,
-                Client.due_date < today  # Already passed due date (paid)
+                Client.last_payment_date >= month_start,
+                Client.last_payment_date <= month_end
             )
             clients_paid = clients_paid_query.count()
             
-            # Calculate revenue from clients who already paid
+            # Calculate revenue from clients who already paid this month
             revenue_paid = sum(client.plan_price or 0 for client in clients_paid_query.all())
             
             # Revenue still to be collected
@@ -4903,8 +4905,17 @@ async def set_morning_time_callback(update: Update, context: ContextTypes.DEFAUL
 
 ⏰ Digite o horário para envio dos lembretes matinais.
 
-📝 **Formato:** HH:MM (exemplo: 09:30)
-🕘 **Padrão atual:** 09:00
+📝 **Formato:** HH:MM (24 horas)
+
+⭐ **Exemplos comuns:**
+• **09:00** = 9:00 da manhã
+• **10:30** = 10:30 da manhã
+• **14:00** = 2:00 da tarde
+• **21:00** = 9:00 da noite
+
+🕘 **Padrão:** 09:00 (9h da manhã)
+
+⚠️ **Atenção:** Para 9 da manhã digite **09:00** (não 21:00)
 
 💡 *Este horário será usado para enviar lembretes de:*
 • 2 dias antes do vencimento
@@ -4948,8 +4959,17 @@ async def set_report_time_callback(update: Update, context: ContextTypes.DEFAULT
 
 ⏰ Digite o horário para receber o relatório diário.
 
-📝 **Formato:** HH:MM (exemplo: 08:30)
-🕗 **Padrão atual:** 08:00
+📝 **Formato:** HH:MM (24 horas)
+
+⭐ **Exemplos comuns:**
+• **08:00** = 8:00 da manhã
+• **09:30** = 9:30 da manhã
+• **13:00** = 1:00 da tarde
+• **20:00** = 8:00 da noite
+
+🕗 **Padrão:** 08:00 (8h da manhã)
+
+⚠️ **Atenção:** Para 8 da manhã digite **08:00** (não 20:00)
 
 💡 *O relatório diário inclui:*
 • Clientes em atraso
@@ -5281,7 +5301,21 @@ async def process_schedule_time_setting(update: Update, context: ContextTypes.DE
     try:
         # Validate time format
         if not validate_time_format(time_input):
-            await update.message.reply_text("❌ Formato inválido! Use o formato HH:MM (exemplo: 09:30)")
+            await update.message.reply_text("""❌ **Formato inválido!** 
+
+Use o formato **HH:MM** (24 horas):
+
+✅ **Correto:**
+• 09:00 (9 da manhã)
+• 14:30 (2:30 da tarde)
+• 21:00 (9 da noite)
+
+❌ **Incorreto:**
+• 9:00 (falta o zero)
+• 25:00 (hora inválida)
+• 9 AM (formato incorreto)
+
+Tente novamente:""", parse_mode='Markdown')
             # Stay in same state to get new input
             if time_type == "morning":
                 return SCHEDULE_WAITING_MORNING_TIME

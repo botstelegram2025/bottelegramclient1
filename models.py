@@ -47,6 +47,7 @@ class Client(Base):
     auto_reminders_enabled = Column(Boolean, default=True)  # Individual client reminder control
     reminder_status = Column(String(20), default='pending')  # pending, sent - controls reminder queue
     last_reminder_sent = Column(Date)  # Track when last reminder was sent
+    last_payment_date = Column(Date)  # Track when last payment was received
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     notes = Column(Text)
