@@ -3358,7 +3358,7 @@ async def handle_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"✅ Telefone atualizado com sucesso!\n\n"
                     f"**Antes:** {old_phone}\n"
-                    f"**Agora:** {clean_phone}",
+                    f"**Agora:** {normalized_phone}",
                     parse_mode='Markdown',
                     reply_markup=get_client_keyboard()
                 )
