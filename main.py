@@ -387,7 +387,6 @@ Use o teclado abaixo para começar:
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         return
     user = update.effective_user
