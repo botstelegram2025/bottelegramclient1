@@ -70,7 +70,7 @@ class SchedulerService:
                 logger.error(f"Error in scheduler: {e}")
 
     
-def _check_reminder_times(self):
+    def _check_reminder_times(self):
         """Check if it's time for any user's scheduled reminders or reports (São Paulo TZ, run-once per day)."""
         try:
             from services.database_service import DatabaseService
