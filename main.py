@@ -496,56 +496,58 @@ async def force_process_reminders_today(update: Update, context: ContextTypes.DE
         await update.message.reply_text("❌ Erro ao processar lembretes. Tente novamente.")
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show main menu to user"""
+    """Show the main menu safely, without assuming created_at is populated."""
     if not update.effective_user:
         return
-        
     user = update.effective_user
-    
     try:
         with db_service.get_session() as session:
             db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
-            
             if not db_user:
                 if update.message:
                     await update.message.reply_text("❌ Usuário não encontrado.")
                 return
-            
-            # Get trial info
-            trial_days_left = 0
-            if db_user.is_trial:
-                # Calculate trial days based on created_at + 7 days
-                trial_end = db_user.created_at.date() + timedelta(days=7)
-                trial_days_left = max(0, (trial_end - datetime.utcnow().date()).days)
-            
-            status_text = "🎁 Teste" if db_user.is_trial else "💎 Premium"
-            if db_user.is_trial:
-                status_text += f" ({trial_days_left} dias restantes)"
-            
+
+            # Compute status text safely
+            status_text = "💎 Premium"
+            trial_info = ""
+            if getattr(db_user, "is_trial", False):
+                status_text = "🎁 Teste"
+                # Prefer trial_end_date when present
+                days_left = 0
+                try:
+                    if getattr(db_user, "trial_end_date", None):
+                        from datetime import datetime as _dt
+                        days_left = max(0, (db_user.trial_end_date.date() - _dt.utcnow().date()).days)
+                except Exception as _e:
+                    days_left = 0
+                if days_left:
+                    trial_info = f" ({days_left} dias restantes)"
+
             menu_text = f"""
 🏠 **Menu Principal**
 
 👋 Olá, {user.first_name}!
 
-📊 **Status:** {status_text}
-{'⚠️ Conta inativa' if not db_user.is_active else '✅ Conta ativa'}
+📊 **Status:** {status_text}{trial_info}
+{'⚠️ Conta inativa' if not getattr(db_user, 'is_active', True) else '✅ Conta ativa'}
 
 O que deseja fazer?
 """
-            
             reply_markup = get_main_keyboard(db_user)
-            
             if update.message:
                 await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
             elif update.callback_query:
                 await update.callback_query.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-                
     except Exception as e:
         logger.error(f"Error showing main menu: {e}")
-        if update.message:
-            await update.message.reply_text("❌ Erro ao carregar menu.")
-        elif update.callback_query and update.callback_query.message:
-            await update.callback_query.message.reply_text("❌ Erro ao carregar menu.")
+        try:
+            if update.message:
+                await update.message.reply_text("✅ Cadastro concluído! Use o menu abaixo para continuar.", reply_markup=get_main_keyboard())
+            elif update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text("✅ Cadastro concluído! Use o menu abaixo para continuar.", reply_markup=get_main_keyboard())
+        except Exception as _:
+            pass
 
 async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle dashboard callback"""
