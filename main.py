@@ -342,7 +342,7 @@ Digite seu número com DDD (ex: 11999999999):
         await update.message.reply_text(welcome_message, parse_mode='Markdown')
     return WAITING_FOR_PHONE
 
-# --- Accept Telegram contact in registration ---
+# --- Accept Telegram contact during registration (minimal patch) ---
 async def handle_phone_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Aceita contato compartilhado pelo Telegram (update.message.contact.phone_number)
@@ -360,15 +360,14 @@ async def handle_phone_contact(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone number input during registration"""
+    """Handle phone number input during registration (safe session usage)"""
     if not update.effective_user or not update.message:
         return ConversationHandler.END
+
     user = update.effective_user
-
     logger.info(f"🔄 REGISTRATION: Processing phone number for user {user.id}")
-    phone_number = update.message.text or ""
 
-    # Validate and normalize phone number
+    phone_number = update.message.text or ""
     normalized_phone = normalize_brazilian_phone(phone_number)
     if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text(
@@ -379,7 +378,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     clean_phone = normalized_phone
 
-    # Prepare locals to avoid using ORM instance after session closes
+    # Prepare locals to avoid using ORM instance outside session
     trial_start = datetime.utcnow()
     trial_end = trial_start + timedelta(days=7)
     trial_end_str = trial_end.strftime('%d/%m/%Y às %H:%M')
@@ -387,14 +386,12 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         with db_service.get_session() as session:
-            # Check if user already exists
             existing_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
             if existing_user:
                 logger.warning(f"User {user.id} already exists")
                 await update.message.reply_text("❌ Usuário já cadastrado. Use /start para acessar o menu.")
                 return ConversationHandler.END
 
-            # Create new user
             new_user = User(
                 telegram_id=str(user.id),
                 first_name=user.first_name or 'Usuário',
@@ -407,7 +404,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
                 is_active=True
             )
             session.add(new_user)
-            session.flush()  # assign PK
+            session.flush()
             new_user_id = new_user.id
             session.commit()
 
@@ -432,8 +429,6 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 Use o teclado abaixo para começar:
 """
         await update.message.reply_text(success_message, parse_mode='Markdown')
-
-        # Mostrar menu principal após o cadastro
         await show_main_menu(update, context)
         return ConversationHandler.END
 
@@ -5102,7 +5097,10 @@ def main():
         user_registration_handler = ConversationHandler(
             entry_points=[CommandHandler("start", start_command)],
             states={
-                WAITING_FOR_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_number)]
+                WAITING_FOR_PHONE: [
+                MessageHandler(filters.CONTACT, handle_phone_contact),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_number)
+            ]
             },
             fallbacks=[CommandHandler("start", start_command)],
             per_message=False
