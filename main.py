@@ -345,9 +345,11 @@ Digite seu número com DDD (ex: 11999999999):
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle phone number input during registration"""
     if not update.effective_user or not update.message:
-        return
+        return ConversationHandler.END
         
     user = update.effective_user
+    
+    logger.info(f"🔄 REGISTRATION: Processing phone number for user {user.id}")
     phone_number = update.message.text or ""
     
     # Validate and normalize phone number
@@ -422,10 +424,14 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 Use o teclado abaixo para começar:
 """
             
-            logger.info(f"Registration completed successfully for user {new_user.id}")
+            logger.info(f"✅ REGISTRATION: Completed successfully for user {new_user.id}")
             
             await update.message.reply_text(success_message, parse_mode='Markdown')
+            
+            logger.info(f"🏠 REGISTRATION: Showing main menu and ending conversation...")
             await show_main_menu(update, context)
+            
+            logger.info(f"🔚 REGISTRATION: ConversationHandler.END returned for user {new_user.id}")
             return ConversationHandler.END
             
     except Exception as e:
@@ -441,6 +447,8 @@ Use o teclado abaixo para começar:
             error_msg += "Tente novamente em alguns segundos."
             
         await update.message.reply_text(error_msg)
+        
+        logger.error(f"🔁 REGISTRATION: Staying in WAITING_FOR_PHONE due to error")
         return WAITING_FOR_PHONE
 
 async def force_process_reminders_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
