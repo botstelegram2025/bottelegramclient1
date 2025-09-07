@@ -161,7 +161,7 @@ class SchedulerService:
                 asyncio.set_event_loop(loop)
                 return loop
     
-        def _send_user_reminders(self, user_id, time_period):
+    def _send_user_reminders(self, user_id, time_period):
             """Send reminders for a specific user"""
             try:
                 # Create new event loop for this thread
@@ -180,7 +180,7 @@ class SchedulerService:
                 if self.loop:
                     self.loop.close()
     
-        def _send_user_notifications_for_user(self, user_id):
+    def _send_user_notifications_for_user(self, user_id):
             """Send daily notifications to specific user about their clients' due dates"""
             try:
                 # Create new event loop for this thread
@@ -196,7 +196,7 @@ class SchedulerService:
                 if self.loop:
                     self.loop.close()
     
-        def _auto_daily_reset(self):
+    def _auto_daily_reset(self):
             """Automatic daily reset at 5:00 AM São Paulo time to clear 'already sent today' flags"""
             try:
                 # Use Brazil timezone (America/Sao_Paulo)
@@ -230,7 +230,7 @@ class SchedulerService:
                 import traceback
                 logger.error(traceback.format_exc())
     
-        def _check_pending_payments(self):
+    def _check_pending_payments(self):
             """Check pending payments and process approved ones automatically"""
             logger.info("🔍 Checking pending payments for automatic processing")
             
@@ -359,7 +359,7 @@ class SchedulerService:
                 import traceback
                 logger.error(traceback.format_exc())
     
-        def _check_due_dates(self):
+    def _check_due_dates(self):
             """Check for overdue clients and update status"""
             logger.info("Running due date check")
             
@@ -389,7 +389,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error checking due dates: {e}")
     
-        def _send_user_notifications(self):
+    def _send_user_notifications(self):
             """Send daily notifications to users about their clients' due dates"""
             logger.info("Running daily user notifications")
             
@@ -407,7 +407,7 @@ class SchedulerService:
                 if self.loop:
                     self.loop.close()
     
-        async def _process_user_notifications(self):
+    async def _process_user_notifications(self):
             """Process and send daily notifications to users via Telegram"""
             from services.database_service import DatabaseService
             from services.telegram_service import telegram_service
@@ -468,7 +468,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error processing user notifications: {e}")
     
-        def _build_notification_message(self, overdue_clients, due_today, due_tomorrow, due_day_after):
+    def _build_notification_message(self, overdue_clients, due_today, due_tomorrow, due_day_after):
             """Build the notification message for user"""
             message = "📅 **Relatório Diário de Vencimentos**\n\n"
             
@@ -513,7 +513,7 @@ class SchedulerService:
             
             return message
     
-        async def _process_reminders(self):
+    async def _process_reminders(self):
             """Process and send reminder messages"""
             from services.database_service import DatabaseService
             from services.whatsapp_service import WhatsAppService
@@ -546,7 +546,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error processing reminders: {e}")
     
-        async def _process_evening_reminders(self):
+    async def _process_evening_reminders(self):
             """Process evening reminders for next day due dates"""
             from services.database_service import DatabaseService
             from services.whatsapp_service import WhatsAppService
@@ -567,7 +567,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error processing evening reminders: {e}")
     
-        async def _send_reminder_type(self, session, user, target_date, reminder_type, whatsapp_service):
+    async def _send_reminder_type(self, session, user, target_date, reminder_type, whatsapp_service):
             """Send specific type of reminder"""
             from models import Client, MessageTemplate, MessageLog
             
@@ -669,7 +669,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error sending {reminder_type} reminders: {e}")
     
-        def _replace_template_variables(self, template_content, client):
+    def _replace_template_variables(self, template_content, client):
             """Replace template variables with client data"""
             variables = {
                 '{nome}': client.name,
@@ -691,7 +691,7 @@ class SchedulerService:
             
             return result.strip()
     
-        async def _send_reminders_by_type(self, session, user, clients, reminder_type, whatsapp_service):
+    async def _send_reminders_by_type(self, session, user, clients, reminder_type, whatsapp_service):
             """Send reminders to specific clients by type"""
             from models import MessageTemplate, MessageLog
             
@@ -789,126 +789,126 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error sending {reminder_type} reminders: {e}")
     
-        async def _process_daily_reminders_for_user(self, user_id):
-            """Process daily reminders - DIRECT SYNC VERSION TO AVOID ASYNC ISSUES"""
-            logger.info(f"🚀 DIRECT: Starting reminder processing for user {user_id}")
+    async def _process_daily_reminders_for_user(self, user_id):
+        """Process daily reminders - DIRECT SYNC VERSION TO AVOID ASYNC ISSUES"""
+        logger.info(f"🚀 DIRECT: Starting reminder processing for user {user_id}")
             
-            try:
-                # Execute the reminder sending directly in a synchronous way
-                import threading
-                result_container = {"success": False, "error": None}
+        try:
+            # Execute the reminder sending directly in a synchronous way
+            import threading
+            result_container = {"success": False, "error": None}
                 
-                def direct_send():
-                    try:
-                        from services.database_service import DatabaseService  
-                        from services.whatsapp_service import WhatsAppService
-                        from models import Client, User, MessageTemplate, MessageLog
-                        from datetime import date, timedelta, datetime
+            def direct_send():
+                try:
+                    from services.database_service import DatabaseService  
+                    from services.whatsapp_service import WhatsAppService
+                    from models import Client, User, MessageTemplate, MessageLog
+                    from datetime import date, timedelta, datetime
                         
-                        db = DatabaseService()
-                        ws = WhatsAppService()
-                        today = _today_sp()
-                        tomorrow = today + timedelta(days=1)
+                    db = DatabaseService()
+                    ws = WhatsAppService()
+                    today = _today_sp()
+                    tomorrow = today + timedelta(days=1)
                         
-                        logger.info(f"🔍 DIRECT: Looking for clients due {tomorrow}")
+                    logger.info(f"🔍 DIRECT: Looking for clients due {tomorrow}")
                         
-                        with db.get_session() as session:
-                            # Find tomorrow's clients
-                            clients = session.query(Client).filter(
-                                Client.user_id == user_id,
-                                Client.status == 'active', 
-                                Client.auto_reminders_enabled == True,
-                                Client.due_date == tomorrow
-                            ).all()
+                    with db.get_session() as session:
+                        # Find tomorrow's clients
+                        clients = session.query(Client).filter(
+                            Client.user_id == user_id,
+                            Client.status == 'active', 
+                            Client.auto_reminders_enabled == True,
+                            Client.due_date == tomorrow
+                        ).all()
                             
-                            logger.info(f"📋 DIRECT: Found {len(clients)} clients for user {user_id}")
+                        logger.info(f"📋 DIRECT: Found {len(clients)} clients for user {user_id}")
                             
-                            if not clients:
-                                result_container["success"] = True
-                                return
-                                
-                            # Get template
-                            template = session.query(MessageTemplate).filter_by(
-                                user_id=user_id,
-                                template_type='reminder_1_day',
-                                is_active=True
-                            ).first()
-                            
-                            if not template:
-                                logger.warning(f"❌ DIRECT: No template found")
-                                result_container["error"] = "No template"
-                                return
-                            
-                            logger.info(f"📝 DIRECT: Using template: {template.name}")
-                            
-                            # Send to each client
-                            for client in clients:
-                                logger.info(f"📨 DIRECT: Sending to {client.name}")
-                                
-                                # Replace variables
-                                message_content = template.content
-                                variables = {
-                                    '{nome}': client.name,
-                                    '{plano}': client.plan_name,
-                                    '{valor}': f"{client.plan_price:.2f}",
-                                    '{vencimento}': client.due_date.strftime('%d/%m/%Y'),
-                                    '{servidor}': client.server or 'Não definido',
-                                    '{informacoes_extras}': client.other_info or ''
-                                }
-                                
-                                for var, value in variables.items():
-                                    message_content = message_content.replace(var, str(value))
-                                
-                                # Send message
-                                try:
-                                    result = ws.send_message(client.phone_number, message_content, user_id)
-                                    status = 'sent' if result.get('success') else 'failed'
-                                    error_msg = result.get('error') if not result.get('success') else None
-                                    
-                                    logger.info(f"📊 DIRECT: Result for {client.name}: {status}")
-                                    
-                                except Exception as e:
-                                    status = 'failed'
-                                    error_msg = str(e)
-                                    logger.error(f"❌ DIRECT: Send failed: {e}")
-                                
-                                # Log the message
-                                message_log = MessageLog(
-                                    user_id=user_id,
-                                    client_id=client.id,
-                                    template_type='reminder_1_day',
-                                    recipient_phone=client.phone_number,
-                                    message_content=message_content,
-                                    sent_at=_now_sp(),
-                                    status=status,
-                                    error_message=error_msg
-                                )
-                                session.add(message_log)
-                            
-                            session.commit()
+                        if not clients:
                             result_container["success"] = True
-                            logger.info(f"✅ DIRECT: Completed processing user {user_id}")
+                            return
+                                
+                        # Get template
+                        template = session.query(MessageTemplate).filter_by(
+                            user_id=user_id,
+                            template_type='reminder_1_day',
+                            is_active=True
+                        ).first()
                             
-                    except Exception as e:
-                        logger.error(f"❌ DIRECT: Error in thread: {e}")
-                        result_container["error"] = str(e)
+                        if not template:
+                            logger.warning(f"❌ DIRECT: No template found")
+                            result_container["error"] = "No template"
+                            return
+                            
+                        logger.info(f"📝 DIRECT: Using template: {template.name}")
+                            
+                        # Send to each client
+                        for client in clients:
+                            logger.info(f"📨 DIRECT: Sending to {client.name}")
+                                
+                            # Replace variables
+                            message_content = template.content
+                            variables = {
+                                '{nome}': client.name,
+                                '{plano}': client.plan_name,
+                                '{valor}': f"{client.plan_price:.2f}",
+                                '{vencimento}': client.due_date.strftime('%d/%m/%Y'),
+                                '{servidor}': client.server or 'Não definido',
+                                '{informacoes_extras}': client.other_info or ''
+                            }
+                                
+                            for var, value in variables.items():
+                                message_content = message_content.replace(var, str(value))
+                                
+                            # Send message
+                            try:
+                                result = ws.send_message(client.phone_number, message_content, user_id)
+                                status = 'sent' if result.get('success') else 'failed'
+                                error_msg = result.get('error') if not result.get('success') else None
+                                    
+                                logger.info(f"📊 DIRECT: Result for {client.name}: {status}")
+                                    
+                            except Exception as e:
+                                status = 'failed'
+                                error_msg = str(e)
+                                logger.error(f"❌ DIRECT: Send failed: {e}")
+                                
+                            # Log the message
+                            message_log = MessageLog(
+                                user_id=user_id,
+                                client_id=client.id,
+                                template_type='reminder_1_day',
+                                recipient_phone=client.phone_number,
+                                message_content=message_content,
+                                sent_at=_now_sp(),
+                                status=status,
+                                error_message=error_msg
+                            )
+                            session.add(message_log)
+                            
+                        session.commit()
+                        result_container["success"] = True
+                        logger.info(f"✅ DIRECT: Completed processing user {user_id}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ DIRECT: Error in thread: {e}")
+                    result_container["error"] = str(e)
                 
                 # Execute in thread to avoid async issues
                 thread = threading.Thread(target=direct_send)
                 thread.start()
                 thread.join(timeout=25)  # 25 second timeout
                 
-                if thread.is_alive():
-                    logger.error(f"❌ DIRECT: Thread timeout for user {user_id}")
-                elif result_container["success"]:
-                    logger.info(f"✅ DIRECT: Success for user {user_id}")
-                elif result_container["error"]:
-                    logger.error(f"❌ DIRECT: Error for user {user_id}: {result_container['error']}")
+            if thread.is_alive():
+                logger.error(f"❌ DIRECT: Thread timeout for user {user_id}")
+            elif result_container["success"]:
+                logger.info(f"✅ DIRECT: Success for user {user_id}")
+            elif result_container["error"]:
+                logger.error(f"❌ DIRECT: Error for user {user_id}: {result_container['error']}")
                     
-            except Exception as e:
-                logger.error(f"❌ DIRECT: Main error for user {user_id}: {e}")
+        except Exception as e:
+            logger.error(f"❌ DIRECT: Main error for user {user_id}: {e}")
     
-        def _process_daily_reminders_sync(self, user_id):
+    def _process_daily_reminders_sync(self, user_id):
             """COMPLETELY SYNC VERSION - NO ASYNC AT ALL"""
             logger.info(f"🚀 SYNC: Starting reminder processing for user {user_id}")
             
@@ -1102,7 +1102,7 @@ class SchedulerService:
                 import traceback
                 logger.error(f"SYNC traceback: {traceback.format_exc()}")
     
-        async def _send_simple_reminders(self, session, user, clients, reminder_type):
+    async def _send_simple_reminders(self, session, user, clients, reminder_type):
             """Simplified reminder sending without complex checks"""
             from models import MessageTemplate, MessageLog
             from datetime import datetime
@@ -1163,7 +1163,7 @@ class SchedulerService:
                 logger.error(f"❌ Error in _send_simple_reminders: {e}")
     
     
-        async def _process_user_notifications_for_user(self, user_id):
+    async def _process_user_notifications_for_user(self, user_id):
             """Process daily user notifications for specific user"""
             try:
                 from services.database_service import DatabaseService
@@ -1209,7 +1209,7 @@ class SchedulerService:
                 logger.error(f"Error processing daily notifications for user {user_id}: {str(e)}")
                 logger.error(f"Full traceback: {traceback.format_exc()}")
     
-        async def _send_daily_sending_report(self, session, user):
+    async def _send_daily_sending_report(self, session, user):
             """Send daily report of automated message sending results"""
             try:
                 from datetime import date, datetime
@@ -1321,7 +1321,7 @@ class SchedulerService:
                 import traceback
                 logger.error(f"Full traceback: {traceback.format_exc()}")
     
-        def _check_trial_expiration(self, user, current_date):
+    def _check_trial_expiration(self, user, current_date):
             """Check if user's trial period has expired and send payment notification"""
             try:
                 if not user.is_trial:
@@ -1371,7 +1371,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error checking trial expiration for user {user.id}: {e}")
     
-        async def _send_payment_notification(self, telegram_id):
+    async def _send_payment_notification(self, telegram_id):
             """Send payment notification when trial expires"""
             try:
                 from services.telegram_service import telegram_service
@@ -1398,7 +1398,7 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error sending payment notification: {e}")
     
-        async def _send_trial_reminder(self, telegram_id, days_left):
+    async def _send_trial_reminder(self, telegram_id, days_left):
             """Send trial expiry reminder"""
             try:
                 from services.telegram_service import telegram_service
