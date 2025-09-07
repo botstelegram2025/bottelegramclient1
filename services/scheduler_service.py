@@ -9,11 +9,24 @@ import pytz
 
 logger = logging.getLogger(__name__)
 
+# === Helpers de fuso horário (São Paulo) ===
+def _now_sp():
+    try:
+        return datetime.now(pytz.timezone('America/Sao_Paulo'))
+    except Exception:
+        return _now_sp()
+
+def _today_sp():
+    return _now_sp().date()
+# ===========================================
+
 class SchedulerService:
     def __init__(self):
         self.is_running = False
         self.thread = None
         self.loop = None
+        # registro de execução por dia SP
+        self._last_morning_run = {}  # user_id -> date
 
     def start(self):
         """Start the scheduler service"""
@@ -121,7 +134,7 @@ class SchedulerService:
                         try:
                             # CALL SYNC VERSION DIRECTLY - NO MORE ASYNC ISSUES!
                             self._process_daily_reminders_sync(user.id)
-                            
+                self._last_morning_run[user.id] = current_date
                             logger.info(f"✅ TEST MODE: Daily reminders completed for user {user.id}")
                         except Exception as e:
                             logger.error(f"Error processing daily reminders for user {user.id}: {str(e)}")
@@ -283,7 +296,7 @@ class SchedulerService:
 ✅ **PAGAMENTO APROVADO AUTOMATICAMENTE!**
 
 💰 **Valor:** R$ {subscription.amount:.2f}
-📅 **Aprovado em:** {datetime.now().strftime('%d/%m/%Y às %H:%M')}
+📅 **Aprovado em:** {_now_sp().strftime('%d/%m/%Y às %H:%M')}
 
 🎉 **Sua conta foi ativada!**
 • Plano Premium ativo por 30 dias
@@ -363,7 +376,7 @@ class SchedulerService:
             with db_service.get_session() as session:
                 from models import Client
                 
-                today = date.today()
+                today = _today_sp()
                 
                 # Find overdue clients
                 overdue_clients = session.query(Client).filter(
@@ -407,7 +420,7 @@ class SchedulerService:
         
         db_service = DatabaseService()
         
-        today = date.today()
+        today = _today_sp()
         tomorrow = today + timedelta(days=1)
         day_after_tomorrow = today + timedelta(days=2)
         
@@ -468,7 +481,7 @@ class SchedulerService:
         if overdue_clients:
             message += f"🔴 **{len(overdue_clients)} cliente(s) em atraso:**\n"
             for client in overdue_clients[:5]:  # Show max 5
-                days_overdue = (date.today() - client.due_date).days
+                days_overdue = (_today_sp() - client.due_date).days
                 message += f"• {client.name} - {days_overdue} dia(s) de atraso\n"
             if len(overdue_clients) > 5:
                 message += f"• ... e mais {len(overdue_clients) - 5} cliente(s)\n"
@@ -514,7 +527,7 @@ class SchedulerService:
         db_service = DatabaseService()
         whatsapp_service = WhatsAppService()
         
-        today = date.today()
+        today = _today_sp()
         
         # Calculate reminder dates
         reminder_2_days = today + timedelta(days=2)
@@ -547,7 +560,7 @@ class SchedulerService:
         db_service = DatabaseService()
         whatsapp_service = WhatsAppService()
         
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _today_sp() + timedelta(days=1)
         
         try:
             with db_service.get_session() as session:
@@ -590,7 +603,7 @@ class SchedulerService:
                     client_id=client.id,
                     template_id=template.id
                 ).filter(
-                    MessageLog.sent_at >= datetime.combine(date.today(), datetime.min.time())
+                    MessageLog.sent_at >= datetime.combine(_today_sp(), datetime.min.time())
                 ).first()
                 
                 if existing_log:
@@ -617,7 +630,7 @@ class SchedulerService:
                             template_type=reminder_type,
                             recipient_phone=client.phone_number,
                             message_content=message_content,
-                            sent_at=datetime.now(),
+                            sent_at=_now_sp(),
                             status='failed',
                             error_message='WhatsApp not connected'
                         )
@@ -638,7 +651,7 @@ class SchedulerService:
                         client_id=client.id,
                         template_id=template.id,
                         message_content=message_content,
-                        sent_at=datetime.now(),
+                        sent_at=_now_sp(),
                         status='sent'
                     )
                     session.add(message_log)
@@ -650,7 +663,7 @@ class SchedulerService:
                         client_id=client.id,
                         template_id=template.id,
                         message_content=message_content,
-                        sent_at=datetime.now(),
+                        sent_at=_now_sp(),
                         status='failed'
                     )
                     session.add(message_log)
@@ -706,7 +719,7 @@ class SchedulerService:
                     client_id=client.id,
                     template_type=reminder_type
                 ).filter(
-                    MessageLog.sent_at >= datetime.combine(date.today(), datetime.min.time())
+                    MessageLog.sent_at >= datetime.combine(_today_sp(), datetime.min.time())
                 ).first()
                 
                 if existing_log:
@@ -733,7 +746,7 @@ class SchedulerService:
                             template_type=reminder_type,
                             recipient_phone=client.phone_number,
                             message_content=message_content,
-                            sent_at=datetime.now(),
+                            sent_at=_now_sp(),
                             status='failed',
                             error_message='WhatsApp not connected'
                         )
@@ -755,7 +768,7 @@ class SchedulerService:
                         template_type=reminder_type,
                         recipient_phone=client.phone_number,
                         message_content=message_content,
-                        sent_at=datetime.now(),
+                        sent_at=_now_sp(),
                         status='sent'
                     )
                     session.add(message_log)
@@ -769,7 +782,7 @@ class SchedulerService:
                         template_type=reminder_type,
                         recipient_phone=client.phone_number,
                         message_content=message_content,
-                        sent_at=datetime.now(),
+                        sent_at=_now_sp(),
                         status='failed',
                         error_message=error_msg
                     )
@@ -799,7 +812,7 @@ class SchedulerService:
                     
                     db = DatabaseService()
                     ws = WhatsAppService()
-                    today = date.today()
+                    today = _today_sp()
                     tomorrow = today + timedelta(days=1)
                     
                     logger.info(f"🔍 DIRECT: Looking for clients due {tomorrow}")
@@ -871,7 +884,7 @@ class SchedulerService:
                                 template_type='reminder_1_day',
                                 recipient_phone=client.phone_number,
                                 message_content=message_content,
-                                sent_at=datetime.now(),
+                                sent_at=_now_sp(),
                                 status=status,
                                 error_message=error_msg
                             )
@@ -913,14 +926,14 @@ class SchedulerService:
             
             db = DatabaseService()
             ws = WhatsAppService()
-            today = date.today()
+            today = _today_sp()
             tomorrow = today + timedelta(days=1)
             
             logger.info(f"🔍 SYNC: Looking for clients due {tomorrow}")
             
             with db.get_session() as session:
                 # Get all reminder types and their clients
-                today = date.today()
+                today = _today_sp()
                 tomorrow = today + timedelta(days=1)
                 day_after_tomorrow = today + timedelta(days=2)
                 
@@ -1015,7 +1028,7 @@ class SchedulerService:
                         logger.info(f"📨 SYNC: Processing {client.name} (ID: {client.id}) - {reminder_type}")
                         
                         # CHECK IF THIS SPECIFIC REMINDER TYPE ALREADY SENT TODAY
-                        today = datetime.now().date()
+                        today = _now_sp().date()
                         existing_log = session.query(MessageLog).filter(
                             MessageLog.user_id == user_id,
                             MessageLog.client_id == client.id,
@@ -1068,7 +1081,7 @@ class SchedulerService:
                                 template_type=reminder_type,  # Fixed: use correct reminder_type
                                 recipient_phone=client.phone_number,
                                 message_content=message_content,
-                                sent_at=datetime.now(),
+                                sent_at=_now_sp(),
                                 status=status,
                                 error_message=error_msg
                             )
@@ -1078,7 +1091,7 @@ class SchedulerService:
                             # UPDATE LAST REMINDER INFO (BUT KEEP IN QUEUE FOR FUTURE REMINDERS!)
                             if status == 'sent':
                                 try:
-                                    client.last_reminder_sent = datetime.now().date()
+                                    client.last_reminder_sent = _now_sp().date()
                                     logger.info(f"✅ SYNC: {client.name} received {reminder_type} - REMAINS in queue for future reminders")
                                 except Exception as e:
                                     logger.warning(f"Could not update last_reminder_sent (field may not exist): {e}")
@@ -1142,7 +1155,7 @@ class SchedulerService:
                     template_type=reminder_type,
                     recipient_phone=client.phone_number,
                     message_content=message_content,
-                    sent_at=datetime.now(),
+                    sent_at=_now_sp(),
                     status=status,
                     error_message=error_msg
                 )
@@ -1178,7 +1191,7 @@ class SchedulerService:
                 if not clients:
                     return
                 
-                today = date.today()
+                today = _today_sp()
                 tomorrow = today + timedelta(days=1)
                 day_after = today + timedelta(days=2)
                 
@@ -1208,7 +1221,7 @@ class SchedulerService:
             from services.telegram_service import telegram_service
             from models import MessageLog, Client
             
-            today = date.today()
+            today = _today_sp()
             
             # Get today's message logs for this user
             today_logs = session.query(MessageLog).filter(
