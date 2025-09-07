@@ -69,41 +69,41 @@ class SchedulerService:
             except Exception as e:
                 logger.error(f"Error in scheduler: {e}")
 
-    def _check_reminder_times(self):
-        """Check if it's time for any user's scheduled reminders or reports - improved to handle missed executions"""
+    
+def _check_reminder_times(self):
+        """Check if it's time for any user's scheduled reminders or reports (São Paulo TZ, run-once per day)."""
         try:
             from services.database_service import DatabaseService
-            from models import User, UserScheduleSettings, Client, MessageTemplate, MessageLog
-            from services.whatsapp_service import whatsapp_service
-            from services.telegram_service import telegram_service
-            from datetime import date, time
-            
+            from models import User, UserScheduleSettings
+            from datetime import time as _time
+
             db_service = DatabaseService()
-            
-            # Use Brazil timezone (America/Sao_Paulo)
+
+            # São Paulo time
             brazil_tz = pytz.timezone('America/Sao_Paulo')
-            current_datetime = datetime.now(brazil_tz)
-            current_time_str = current_datetime.strftime("%H:%M")
-            current_date = current_datetime.date()
-            current_time = current_datetime.time()
-            
-            logger.info(f"Checking reminder times at {current_time_str}")
-            
+            now_sp = datetime.now(brazil_tz)
+            current_date = now_sp.date()
+            current_time = now_sp.time()
+            current_time_str = now_sp.strftime("%H:%M")
+            logger.info(f"Checking reminder times at {current_time_str} (São Paulo)")
+
             with db_service.get_session() as session:
-                # Get all active users with their schedule settings
+                # active users + optional schedule
                 users_settings = session.query(User, UserScheduleSettings).join(
                     UserScheduleSettings, User.id == UserScheduleSettings.user_id, isouter=True
                 ).filter(User.is_active == True).all()
-                
+
                 logger.info(f"Found {len(users_settings)} users to check")
-                
+
                 for user, settings in users_settings:
-                    # Check for trial expiration first
-                    self._check_trial_expiration(user, current_date)
-                    
+                    # trial expiration based on SP date
+                    try:
+                        self._check_trial_expiration(user, current_date)
+                    except Exception as _e:
+                        logger.error(f"trial check failed for user {user.id}: {_e}")
+
                     if not settings:
-                        # Create default settings if none exist
-                        logger.info(f"Creating default settings for user {user.id}")
+                        # defaults
                         settings = UserScheduleSettings(
                             user_id=user.id,
                             morning_reminder_time='09:00',
@@ -112,41 +112,35 @@ class SchedulerService:
                         )
                         session.add(settings)
                         session.commit()
-                    
-                    # Check if automated sending is enabled for this user
+
                     if hasattr(settings, 'auto_send_enabled') and not settings.auto_send_enabled:
                         logger.info(f"Auto send disabled for user {user.id}, skipping")
                         continue
-                    
-                    logger.info(f"Checking times for user {user.id}: morning={settings.morning_reminder_time}, report={settings.daily_report_time}")
-                    
-                    # Parse daily reminder time
+
+                    # parse daily reminder time
                     try:
-                        morning_time_str = settings.morning_reminder_time if settings.morning_reminder_time else '09:00'
-                        daily_time = datetime.strptime(morning_time_str, "%H:%M").time()
-                    except ValueError as e:
+                        mt = settings.morning_reminder_time or '09:00'
+                        hh, mm = map(int, mt.split(':'))
+                        daily_time = _time(hh, mm, 0)
+                    except Exception as e:
                         logger.error(f"Invalid time format for user {user.id}: {e}")
-                        continue
-                    
-                    # Check daily reminders - execute if time passed (NO PROTECTION DURING TEST PHASE)
-                    if current_time >= daily_time:
-                        logger.info(f"🧪 TEST MODE: Processing daily reminders for user {user.id} (time passed: {current_time_str} >= {settings.morning_reminder_time})")
+                        daily_time = _time(9, 0, 0)
+
+                    last_run = self._last_morning_run.get(user.id)
+                    if (current_time >= daily_time) and (last_run != current_date):
+                        logger.info(f"⏰ Triggering daily reminders for user {user.id} at {current_time_str} (scheduled {mt})")
                         try:
-                            # CALL SYNC VERSION DIRECTLY - NO MORE ASYNC ISSUES!
                             self._process_daily_reminders_sync(user.id)
-                self._last_morning_run[user.id] = current_date
-                            logger.info(f"✅ TEST MODE: Daily reminders completed for user {user.id}")
+                            self._last_morning_run[user.id] = current_date
+                            logger.info(f"✅ Daily reminders completed for user {user.id}")
                         except Exception as e:
-                            logger.error(f"Error processing daily reminders for user {user.id}: {str(e)}")
-                            import traceback
-                            logger.error(f"Full traceback: {traceback.format_exc()}")
-                    
-                    # Daily report processing disabled during test phase
-                    # (Only focusing on reminder testing for now)
-                    logger.debug(f"🧪 TEST MODE: Daily report processing disabled for user {user.id}")
-            
+                            logger.error(f"Error processing daily reminders for user {user.id}: {e}")
+                    else:
+                        reason = "already ran today" if last_run == current_date else "not time yet"
+                        logger.debug(f"Skipping user {user.id}: {reason}")
         except Exception as e:
             logger.error(f"Error checking reminder times: {e}")
+
 
     def _get_event_loop(self):
         """Get or create event loop for async operations"""
