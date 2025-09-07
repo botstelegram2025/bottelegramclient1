@@ -1424,4 +1424,5 @@ class SchedulerService:
                 logger.error(f"Error sending trial reminder: {e}")
     
     # Global scheduler service instance
-    scheduler_service = SchedulerService()
+
+scheduler_service = SchedulerService()
