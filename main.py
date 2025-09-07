@@ -459,6 +459,105 @@ async def show_main_menu_message(message, context):
     except Exception as e:
         logger.error(f"Error showing main menu: {e}")
 
+
+# ---------------- Main Menu Text Router ----------------
+async def send_simple_notice(update: Update, text: str, keyboard=None):
+    try:
+        if update.message:
+            await update.message.reply_text(text, reply_markup=keyboard or get_main_keyboard(), parse_mode='Markdown')
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(text, reply_markup=keyboard or get_main_keyboard(), parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"send_simple_notice error: {e}")
+
+async def show_clients_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Adicionar Cliente", callback_data="add_client")],
+        [InlineKeyboardButton("📋 Ver Clientes (lista)", callback_data="manage_clients")],
+        [InlineKeyboardButton("🔙 Menu Principal", callback_data="main_menu")]
+    ])
+    await send_simple_notice(update, "👥 *Clientes*\n\nEscolha uma opção:", kb)
+
+async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_simple_notice(update, "📊 *Dashboard*\n\n(Em breve: gráficos de vencimentos, status de mensagens e receita mensal.)")
+
+async def show_templates_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_simple_notice(update, "📋 *Templates*\n\n(Em breve: gerenciar modelos, criar/editar e aplicar a clientes.)")
+
+async def show_schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_simple_notice(update, "⏰ *Horários*\n\n(Em breve: configurar hora de verificação e envio diário.)")
+
+async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_simple_notice(update, "💳 *Assinatura*\n\nPlano atual: *Teste (7 dias)*.\n(Em breve: link PIX para ativar mensalidade.)")
+
+async def force_today_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Placeholder: se houver um método real no scheduler_service, chame aqui.
+    try:
+        # if hasattr(scheduler_service, "run_now"):
+        #     scheduler_service.run_now()
+        await send_simple_notice(update, "🚀 *Forçar Hoje*\n\nFila de envios marcada para execução imediata (modo demonstração).")
+    except Exception as e:
+        logger.error(f"force_today_jobs error: {e}")
+        await send_simple_notice(update, "❌ Não foi possível disparar agora. Verifique os logs.")
+
+async def show_whatsapp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "📱 *WhatsApp*\n\n"
+        "• Gere QR: `/qr/{seuUserId}`\n"
+        "• Status: `/status/{seuUserId}`\n"
+        "• Enviar: `POST /send/{seuUserId}`\n\n"
+        "_(Em breve: painel dentro do Telegram.)_"
+    )
+    if update.message:
+        await update.message.reply_text(txt, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    else:
+        await send_simple_notice(update, txt)
+
+async def handle_main_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+
+    if text in ("🏠 Menu Principal", "🔙 Menu Principal"):
+        await show_main_menu(update, context)
+        return
+
+    if text.startswith("👥"):
+        await show_clients_menu(update, context)
+        return
+
+    if text.startswith("📊"):
+        await show_dashboard(update, context)
+        return
+
+    if text.startswith("📋"):
+        await show_templates_menu(update, context)
+        return
+
+    if text.startswith("⏰"):
+        await show_schedule_menu(update, context)
+        return
+
+    if text.startswith("💳"):
+        await show_subscription(update, context)
+        return
+
+    if text.startswith("🚀"):
+        await force_today_jobs(update, context)
+        return
+
+    if text.startswith("📱"):
+        await show_whatsapp_menu(update, context)
+        return
+
+    if text.startswith("❓"):
+        await help_command(update, context)
+        return
+
+    # Default fallback on main menu
+    await send_simple_notice(update, "🤔 Não entendi. Escolha uma opção do *Menu Principal*.")
+
+
 # --------- Client creation flow (kept) ---------
 async def add_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.callback_query:
@@ -941,9 +1040,12 @@ def build_application() -> Application:
     # Basic commands
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
+    # Router para botões/textos do Menu Principal
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu_choice))
 
     # Inline callbacks basics
     application.add_handler(CallbackQueryHandler(add_client_callback, pattern="^add_client$"))
+    application.add_handler(CallbackQueryHandler(lambda u,c: send_simple_notice(u, "📋 *Lista de clientes*: (em breve)", None), pattern="^manage_clients$"))
     application.add_handler(CallbackQueryHandler(lambda u, c: asyncio.create_task(show_main_menu(u, c)), pattern="^main_menu$"))
 
     # Error handler
