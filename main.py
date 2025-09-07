@@ -273,7 +273,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # User exists but inactive (trial expired)
                     await show_reactivation_screen(update, context)
             else:
-                await start_registration(update, context)
+                return await start_registration(update, context)
                 
     except Exception as e:
         logger.error(f"Error in start command: {e}")
