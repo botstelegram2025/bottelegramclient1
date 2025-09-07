@@ -302,6 +302,7 @@ async def handle_phone_contact(update: Update, context: ContextTypes.DEFAULT_TYP
     update.message.text = contact_number
     return await handle_phone_number(update, context)
 
+
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
         return ConversationHandler.END
@@ -311,19 +312,28 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     normalized_phone = normalize_brazilian_phone(phone_number)
     if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text(
-            "❌ Número inválido. Digite apenas números com DDD.\n**Exemplo:** 11999999999",
+            "❌ Número inválido. Digite apenas números com DDD.
+**Exemplo:** 11999999999",
             parse_mode='Markdown'
         )
         return WAITING_FOR_PHONE
     clean_phone = normalized_phone
+
+    # Prepare locals to avoid accessing ORM instance after session closes
+    trial_end_dt = datetime.utcnow() + timedelta(days=7)
+    trial_end_str = trial_end_dt.strftime('%d/%m/%Y às %H:%M')
+    new_user_id = None
+
     try:
         logger.info(f"Starting user registration for telegram_id: {user.id}")
+        # OPEN SESSION
         with db_service.get_session() as session:
             existing_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
             if existing_user:
                 logger.warning(f"User {user.id} already exists")
                 await update.message.reply_text("❌ Usuário já cadastrado. Use /start para acessar o menu.")
                 return ConversationHandler.END
+
             new_user = User(
                 telegram_id=str(user.id),
                 first_name=user.first_name or 'Usuário',
@@ -331,21 +341,27 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
                 username=user.username or '',
                 phone_number=clean_phone,
                 trial_start_date=datetime.utcnow(),
-                trial_end_date=datetime.utcnow() + timedelta(days=7),
+                trial_end_date=trial_end_dt,
                 is_trial=True,
                 is_active=True
             )
             session.add(new_user)
+            session.flush()  # assign PK
+            new_user_id = new_user.id
             session.commit()
+
+        # Create defaults in a fresh session to avoid stale bindings
+        if new_user_id:
             try:
-                await create_default_templates_in_db(new_user.id)
+                await create_default_templates_in_db(new_user_id)
             except Exception as e:
-                logger.error(f"Error creating templates for user {new_user.id}: {e}")
-            success_message = f"""
+                logger.error(f"Error creating templates for user {new_user_id}: {e}")
+
+        success_message = f"""
 ✅ **Cadastro realizado com sucesso!**
 
 🆓 Seu período de teste de 7 dias já começou!
-📅 Válido até: {new_user.trial_end_date.strftime('%d/%m/%Y às %H:%M')}
+📅 Válido até: {trial_end_str}
 
 🚀 **Próximos passos:**
 1. Cadastre seus primeiros clientes
@@ -354,9 +370,12 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 Use o teclado abaixo para começar:
 """
-            await update.message.reply_text(success_message, parse_mode='Markdown')
-            await show_main_menu(update, context)
-            return ConversationHandler.END
+        await update.message.reply_text(success_message, parse_mode='Markdown')
+
+        # Call menu AFTER session is closed to avoid nested session issues
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+
     except Exception as e:
         logger.error(f"CRITICAL ERROR during user registration for {user.id}: {e}")
         error_msg = "❌ Erro ao cadastrar. "
@@ -367,7 +386,9 @@ Use o teclado abaixo para começar:
         await update.message.reply_text(error_msg)
         return WAITING_FOR_PHONE
 
+
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         return
     user = update.effective_user
