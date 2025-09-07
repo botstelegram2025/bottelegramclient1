@@ -312,8 +312,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     normalized_phone = normalize_brazilian_phone(phone_number)
     if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text(
-            "❌ Número inválido. Digite apenas números com DDD.
-**Exemplo:** 11999999999",
+            "❌ Número inválido. Digite apenas números com DDD.\n**Exemplo:** 11999999999",
             parse_mode='Markdown'
         )
         return WAITING_FOR_PHONE
