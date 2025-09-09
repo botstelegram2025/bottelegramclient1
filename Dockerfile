@@ -1,12 +1,12 @@
 # Multi-service (Node + Python) image for Railway (Web service)
 FROM node:20-slim
 
-# Use bash for RUN steps
+# Usar bash nos RUN (permite blocos e [[ ... ]])
 SHELL ["/bin/bash", "-lc"]
 
 # --- System deps ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-dev \
+    python3 python3-pip python3-venv python3-dev \
     gcc g++ make \
     libpq-dev \
     curl ca-certificates bash \
@@ -15,15 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# --- Node deps (copy package.json and optionally the lockfile) ---
+# --- Node deps (copia package.json e lock se existir) ---
 COPY package.json package-lock.json* ./
 
-# Avoid git prompts; prefer https for github
+# Evitar prompts de git/ssh em deps via Git
 RUN git config --global url."https://github.com/".insteadOf git@github.com: || true \
  && git config --global --add safe.directory /app || true \
  && export GIT_ASKPASS=/bin/true
 
-# Prefer ci when lock is valid; fall back to install if out-of-sync
+# Preferir ci quando lock está válido; fallback para install se fora de sincronia
 RUN if [[ -f package-lock.json ]]; then \
       echo "Using npm ci (lock present)"; \
       npm ci --omit=dev || npm ci --omit=dev --legacy-peer-deps || { \
@@ -36,15 +36,22 @@ RUN if [[ -f package-lock.json ]]; then \
       npm install --omit=dev --legacy-peer-deps; \
     fi
 
+# --- Python venv para evitar PEP 668 (externally-managed-environment) ---
+RUN python3 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
 # --- Python deps ---
 COPY requirements.txt ./
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# --- App code ---
+# --- Código da aplicação ---
 COPY . .
 
+# Diretório usado por Baileys/sessões, se aplicável
 RUN mkdir -p sessions
 
+# --- Environment ---
 ENV NODE_ENV=production \
     PYTHONUNBUFFERED=1 \
     FLASK_HOST=0.0.0.0 \
@@ -52,14 +59,15 @@ ENV NODE_ENV=production \
     PY_ENTRY=main.py \
     NODE_ENTRY=server.js
 
-# Expose for docs
+# Expose (documentação)
 EXPOSE 8080
 EXPOSE 3001
 
-# Healthcheck: both Flask ($PORT) and Node (3001) must be up
+# Healthcheck: Flask ($PORT)/health e Node (3001)/health devem responder
 HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/health" && curl -fsS "http://127.0.0.1:3001/health" || exit 1
 
+# Entrypoint que sobe Node (em background) + Python (foreground)
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
