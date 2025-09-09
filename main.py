@@ -77,35 +77,94 @@ from models import User, Client, Subscription, MessageTemplate, MessageLog
 
 
 
-
+# === Helpers de pagamento ===
 def _extract_payment_id(result: dict) -> str:
     """Tenta extrair o payment_id de vários campos e do ticket_url."""
+    import re as _re
     if not isinstance(result, dict):
         return ""
-    # diretos
     for k in ("payment_id", "id"):
         v = result.get(k)
         if v:
             return str(v)
-    # aninhados comuns
-    def g(d, path, default=None):
+    # aninhados
+    def _g(d, path, default=None):
         cur = d
         for p in path.split("."):
             if not isinstance(cur, dict) or p not in cur:
                 return default
             cur = cur[p]
         return cur
-    rid = g(result, "response.id")
+    rid = _g(result, "response.id")
     if rid:
         return str(rid)
-    tx = g(result, "point_of_interaction.transaction_data", {}) or {}
-    # de ticket_url: .../payments/<id>/ticket...
+    tx = _g(result, "point_of_interaction.transaction_data", {}) or {}
     url = tx.get("ticket_url") or tx.get("url") or result.get("payment_link") or result.get("init_point")
     if isinstance(url, str):
-        m = re.search(r"/payments/(\d+)", url)
+        m = _re.search(r"/payments/(\d+)", url)
         if m:
             return m.group(1)
     return ""
+
+async def _poll_payment_task(bot, payment_id: str, user_id: int, chat_id: int, logger=logger, db_service=db_service):
+    """Tarefa assíncrona: consulta Mercado Pago até aprovar e ativa assinatura no DB."""
+    import asyncio
+    from datetime import datetime, timedelta
+    try:
+        if not payment_id:
+            return
+        tries, max_tries, interval = 0, 180, 5  # ~15min
+        logger.info(f"[AUTO-POLL] start payment_id={payment_id} user_id={user_id}")
+        while tries < max_tries:
+            tries += 1
+            try:
+                status = payment_service.check_payment_status(str(payment_id))
+            except Exception as e:
+                logger.error(f"[AUTO-POLL] check_payment_status error: {e}")
+                status = {"success": False}
+            approved = bool(status.get("success")) and status.get("status") == "approved"
+            pending = status.get("status") in {"pending", "in_process"}
+            if approved:
+                expires = datetime.now() + timedelta(days=30)
+                # Atualiza DB
+                try:
+                    with db_service.get_session() as session:
+                        db_user = session.query(User).filter_by(id=user_id).first()
+                        if db_user:
+                            if hasattr(db_user, "is_trial"):
+                                db_user.is_trial = False
+                            if hasattr(db_user, "is_active"):
+                                db_user.is_active = True
+                            for field in ["subscription_expires_at", "subscription_until", "premium_until", "paid_until", "expires_at"]:
+                                if hasattr(db_user, field):
+                                    setattr(db_user, field, expires)
+                            if hasattr(db_user, "last_payment_id"):
+                                db_user.last_payment_id = str(payment_id)
+                            session.commit()
+                except Exception as e:
+                    logger.error(f"[AUTO-POLL] DB update error: {e}")
+                # Notifica usuário
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "✅ Pagamento confirmado automaticamente!\n"
+                            f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}"
+                        ),
+                        parse_mode=None,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                    )
+                except Exception as e:
+                    logger.error(f"[AUTO-POLL] notify user error: {e}")
+                logger.info(f"[AUTO-POLL] approved payment_id={payment_id} tries={tries}")
+                return
+            if not pending:
+                logger.info(f"[AUTO-POLL] finished without approval payment_id={payment_id} status={status.get('status')}")
+                return
+            await asyncio.sleep(interval)
+        logger.info(f"[AUTO-POLL] timeout payment_id={payment_id}")
+    except Exception as e:
+        logger.error(f"[AUTO-POLL] fatal: {e}")
 
 
 # ---- SAFE GUARD: ensure helper exists even if removed by merge ----
@@ -6540,77 +6599,3 @@ async def disable_reminders_callback(update: Update, context: ContextTypes.DEFAU
 
 if __name__ == '__main__':
     main()
-
-# === Auto-confirmador de pagamentos (pooling pelo JobQueue) ===
-async def _poll_payment_job(context: ContextTypes.DEFAULT_TYPE):
-    """Verifica o status de um pagamento periodicamente e ativa a assinatura ao aprovar."""
-    job = context.job
-    data = job.data or {}
-    payment_id = str(data.get("payment_id") or "")
-    user_id = data.get("user_id")
-    chat_id = data.get("chat_id")
-    tries = int(data.get("tries") or 0)
-    max_tries = int(data.get("max_tries") or 180)  # ~15 min se interval=5s
-
-    try:
-        # 1) Checa status
-        status = payment_service.check_payment_status(payment_id)
-        approved = bool(status.get("success")) and status.get("status") == "approved"
-        pending = status.get("status") in {"pending", "in_process"}
-
-        if approved:
-            from datetime import datetime, timedelta
-            expires = datetime.now() + timedelta(days=30)
-
-            try:
-                with db_service.get_session() as session:
-                    db_user = session.query(User).filter_by(id=user_id).first()
-                    if db_user:
-                        if hasattr(db_user, "is_trial"):
-                            db_user.is_trial = False
-                        if hasattr(db_user, "is_active"):
-                            db_user.is_active = True
-                        # tenta vários nomes de expiração
-                        for field in ["subscription_expires_at", "subscription_until", "premium_until", "paid_until", "expires_at"]:
-                            if hasattr(db_user, field):
-                                setattr(db_user, field, expires)
-                        if hasattr(db_user, "last_payment_id"):
-                            db_user.last_payment_id = payment_id
-                        session.commit()
-            except Exception as e:
-                logger.error(f"[AUTO-POLL] erro ao ativar assinatura no DB: {e}")
-
-            # Notifica usuário
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "✅ Pagamento confirmado automaticamente!\n"
-                        f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}"
-                    ),
-                    parse_mode=None,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                )
-            except Exception as e:
-                logger.error(f"[AUTO-POLL] erro ao notificar usuário: {e}")
-
-            # Encerra o job
-            job.schedule_removal()
-            return
-
-        # Se não aprovado ainda
-        tries += 1
-        data["tries"] = tries
-        job.data = data
-        if tries >= max_tries or not pending:
-            # Sai silenciosamente após o tempo máximo ou status final não aprovado
-            logger.info(f"[AUTO-POLL] encerrado: payment_id={payment_id} status={status.get('status')} tries={tries}")
-            job.schedule_removal()
-    except Exception as e:
-        logger.error(f"[AUTO-POLL] erro no job: {e}")
-        # Em caso de erro não crítico, continua até max_tries
-        tries += 1
-        data["tries"] = tries
-        job.data = data
-        if tries >= max_tries:
-            job.schedule_removal()
