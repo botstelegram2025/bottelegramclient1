@@ -76,96 +76,7 @@ from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
 
-
-# === Helpers de pagamento ===
-def _extract_payment_id(result: dict) -> str:
-    """Tenta extrair o payment_id de vários campos e do ticket_url."""
-    import re as _re
-    if not isinstance(result, dict):
-        return ""
-    for k in ("payment_id", "id"):
-        v = result.get(k)
-        if v:
-            return str(v)
-    # aninhados
-    def _g(d, path, default=None):
-        cur = d
-        for p in path.split("."):
-            if not isinstance(cur, dict) or p not in cur:
-                return default
-            cur = cur[p]
-        return cur
-    rid = _g(result, "response.id")
-    if rid:
-        return str(rid)
-    tx = _g(result, "point_of_interaction.transaction_data", {}) or {}
-    url = tx.get("ticket_url") or tx.get("url") or result.get("payment_link") or result.get("init_point")
-    if isinstance(url, str):
-        m = _re.search(r"/payments/(\d+)", url)
-        if m:
-            return m.group(1)
-    return ""
-
-async def _poll_payment_task(bot, payment_id: str, user_id: int, chat_id: int, logger=logger, db_service=db_service):
-    """Tarefa assíncrona: consulta Mercado Pago até aprovar e ativa assinatura no DB."""
-    import asyncio
-    from datetime import datetime, timedelta
-    try:
-        if not payment_id:
-            return
-        tries, max_tries, interval = 0, 180, 5  # ~15min
-        logger.info(f"[AUTO-POLL] start payment_id={payment_id} user_id={user_id}")
-        while tries < max_tries:
-            tries += 1
-            try:
-                status = payment_service.check_payment_status(str(payment_id))
-            except Exception as e:
-                logger.error(f"[AUTO-POLL] check_payment_status error: {e}")
-                status = {"success": False}
-            approved = bool(status.get("success")) and status.get("status") == "approved"
-            pending = status.get("status") in {"pending", "in_process"}
-            if approved:
-                expires = datetime.now() + timedelta(days=30)
-                # Atualiza DB
-                try:
-                    with db_service.get_session() as session:
-                        db_user = session.query(User).filter_by(id=user_id).first()
-                        if db_user:
-                            if hasattr(db_user, "is_trial"):
-                                db_user.is_trial = False
-                            if hasattr(db_user, "is_active"):
-                                db_user.is_active = True
-                            for field in ["subscription_expires_at", "subscription_until", "premium_until", "paid_until", "expires_at"]:
-                                if hasattr(db_user, field):
-                                    setattr(db_user, field, expires)
-                            if hasattr(db_user, "last_payment_id"):
-                                db_user.last_payment_id = str(payment_id)
-                            session.commit()
-                except Exception as e:
-                    logger.error(f"[AUTO-POLL] DB update error: {e}")
-                # Notifica usuário
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "✅ Pagamento confirmado automaticamente!\n"
-                            f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}"
-                        ),
-                        parse_mode=None,
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                    )
-                except Exception as e:
-                    logger.error(f"[AUTO-POLL] notify user error: {e}")
-                logger.info(f"[AUTO-POLL] approved payment_id={payment_id} tries={tries}")
-                return
-            if not pending:
-                logger.info(f"[AUTO-POLL] finished without approval payment_id={payment_id} status={status.get('status')}")
-                return
-            await asyncio.sleep(interval)
-        logger.info(f"[AUTO-POLL] timeout payment_id={payment_id}")
-    except Exception as e:
-        logger.error(f"[AUTO-POLL] fatal: {e}")
-
+from flask import Flask, request, jsonify
 
 # ---- SAFE GUARD: ensure helper exists even if removed by merge ----
 if "_format_pix_copy_code" not in globals():
@@ -6599,3 +6510,166 @@ async def disable_reminders_callback(update: Update, context: ContextTypes.DEFAU
 
 if __name__ == '__main__':
     main()
+
+
+# ===== Mercado Pago Webhook (Flask) =====
+app = Flask(__name__)
+
+def _extract_tg_id_from_payment(payment: dict) -> str:
+    """Extrai o telegram_id do external_reference/description/metadata."""
+    if not isinstance(payment, dict):
+        return ""
+    import re as _re
+    ext = payment.get("external_reference") or payment.get("external_reference_id") or ""
+    # padrão usado: telegram_bot_<telegram_id>_<timestamp>
+    m = _re.search(r"telegram_bot_(\d+)_", str(ext))
+    if m:
+        return m.group(1)
+    # tentar metadata
+    md = payment.get("metadata") or {}
+    for k in ("telegram_id", "telegram_user_id", "tg_id"):
+        v = md.get(k)
+        if v:
+            return str(v)
+    # tentar na description (se houver)
+    m2 = _re.search(r"telegram[_\s-]?id[:\s-]?(\d+)", str(payment.get("description") or ""), flags=_re.I)
+    if m2:
+        return m2.group(1)
+    return ""
+
+def _activate_user_subscription(session, db_user, payment_id: str):
+    """Marca usuário como ativo por 30 dias e grava last_payment_id se disponível."""
+    from datetime import datetime, timedelta
+    expires = datetime.now() + timedelta(days=30)
+    if hasattr(db_user, "is_trial"):
+        db_user.is_trial = False
+    if hasattr(db_user, "is_active"):
+        db_user.is_active = True
+    for field in ["subscription_expires_at", "subscription_until", "premium_until", "paid_until", "expires_at"]:
+        if hasattr(db_user, field):
+            setattr(db_user, field, expires)
+    if hasattr(db_user, "last_payment_id"):
+        db_user.last_payment_id = str(payment_id)
+    session.commit()
+    return expires
+
+def _notify_user_paid(bot, chat_id: int, expires):
+    try:
+        bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ Pagamento confirmado automaticamente!\n"
+                f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}"
+            ),
+            parse_mode=None,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+        )
+    except Exception as e:
+        logger.error(f"[WEBHOOK] erro ao notificar usuário: {e}")
+
+def _get_telegram_bot_instance():
+    from telegram import Bot
+    from config import Config
+    token = getattr(Config, "TELEGRAM_BOT_TOKEN", None) or getattr(Config, "BOT_TOKEN", None) or getattr(Config, "TELEGRAM_TOKEN", None)
+    if not token:
+        logger.error("[WEBHOOK] Token do Telegram não encontrado em Config.")
+        return None
+    try:
+        return Bot(token)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Falha ao instanciar Bot: {e}")
+        return None
+
+@app.route("/webhook/mercadopago", methods=["POST", "GET"])
+def mercadopago_webhook():
+    try:
+        if request.method == "GET":
+            # Resposta para verificações simples
+            return "OK", 200
+
+        payload = request.get_json(silent=True) or {}
+        # MP pode mandar: {"type":"payment","data":{"id":"<payment_id>"}}
+        payment_id = None
+        if isinstance(payload, dict):
+            if "data" in payload and isinstance(payload["data"], dict) and payload.get("type") in ("payment", "payments"):
+                payment_id = payload["data"].get("id")
+            # fallback: vêm como {resource: ".../payments/<id>"}
+            if not payment_id and "resource" in payload and isinstance(payload["resource"], str):
+                import re as _re
+                m = _re.search(r"/payments/(\d+)", payload["resource"])
+                if m:
+                    payment_id = m.group(1)
+
+        # fallback por query strings (algumas integrações usam)
+        if not payment_id:
+            payment_id = request.args.get("id") or request.args.get("payment_id")
+
+        if not payment_id:
+            logger.error(f"[WEBHOOK] payload sem payment_id: {payload}")
+            return jsonify({"ok": False, "error": "payment_id ausente"}), 200
+
+        # Confirma status no provedor
+        status = payment_service.check_payment_status(str(payment_id))
+        approved = bool(status.get("success")) and status.get("status") == "approved"
+        payment = status.get("raw") or status.get("payment_data") or {}
+
+        if approved:
+            tg_id = _extract_tg_id_from_payment(payment)
+            if not tg_id:
+                logger.error(f"[WEBHOOK] payment aprovado, mas sem telegram_id. payment_id={payment_id}")
+                return jsonify({"ok": True, "warn": "approved_without_tg_id"}), 200
+
+            try:
+                with db_service.get_session() as session:
+                    db_user = session.query(User).filter_by(telegram_id=str(tg_id)).first()
+                    if not db_user:
+                        logger.error(f"[WEBHOOK] usuário não encontrado para telegram_id={tg_id}")
+                        return jsonify({"ok": True, "warn": "user_not_found"}), 200
+                    expires = _activate_user_subscription(session, db_user, str(payment_id))
+
+                # Notifica usuário
+                bot = _get_telegram_bot_instance()
+                if bot:
+                    _notify_user_paid(bot, int(tg_id), expires)
+                else:
+                    logger.error("[WEBHOOK] Bot não pode ser instanciado; notificação pulada.")
+
+                return jsonify({"ok": True, "status": "approved"}), 200
+
+            except Exception as e:
+                logger.error(f"[WEBHOOK] erro ao ativar assinatura: {e}")
+                return jsonify({"ok": False, "error": "db_error"}), 200
+
+        # Não aprovado ainda; respondemos 200 para MP repetir depois, se for o caso.
+        logger.info(f"[WEBHOOK] pagamento não aprovado ainda: id={payment_id} status={status.get('status')}")
+        return jsonify({"ok": True, "status": status.get("status")}), 200
+
+    except Exception as e:
+        logger.error(f"[WEBHOOK] erro inesperado: {e}")
+        return jsonify({"ok": False, "error": "unexpected"}), 200
+
+
+
+
+# ===== Inicialização do servidor Flask em thread separada =====
+def _run_flask():
+    import os
+    host = os.getenv("FLASK_HOST", "0.0.0.0")
+    try:
+        from config import Config
+        port = getattr(Config, "WEBHOOK_PORT", None) or int(os.getenv("PORT", "8080"))
+    except Exception:
+        port = int(os.getenv("PORT", "8080"))
+    logger.info(f"[WEBHOOK] Flask ouvindo em http://{host}:{port}/webhook/mercadopago")
+    # threaded=True para não bloquear; debug False em produção
+    app.run(host=host, port=port, threaded=True, debug=False)
+
+# Inicie esta thread junto com o bot (chame _start_flask_webhook() no bootstrap do seu app)
+def _start_flask_webhook():
+    try:
+        import threading
+        t = threading.Thread(target=_run_flask, daemon=True)
+        t.start()
+    except Exception as e:
+        logger.error(f"[WEBHOOK] falha ao iniciar Flask: {e}")
+
