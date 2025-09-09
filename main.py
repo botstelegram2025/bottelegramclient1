@@ -73,7 +73,6 @@ from services.database_service import db_service
 from services.scheduler_service import scheduler_service
 from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
-import main_auto_confirm_final  # habilita confirmação automática por reconciliação
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
 
@@ -1629,25 +1628,38 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
 
             # Tentativas de criação do pagamento
             result = None
+            tgid_str = str(tg_user.id)
+            external_ref = f"telegram_bot_{tgid_str}_{int(__import__('time').time())}"
+            common_kwargs = {
+                "amount": amount,
+                "description": description,
+                "external_reference": external_ref,
+                "metadata": {"telegram_id": tgid_str},
+                "method": "pix",
+            }
+
             try:
                 if hasattr(payment_service, "create_subscription_payment"):
                     try:
                         result = payment_service.create_subscription_payment(
-                            user_telegram_id=str(tg_user.id), amount=amount, method="pix"
+                            user_telegram_id=tgid_str, **common_kwargs
                         )
                     except TypeError:
-                        result = payment_service.create_subscription_payment(str(tg_user.id), amount)
+                        try:
+                            result = payment_service.create_subscription_payment(tgid_str, amount)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.error(f"create_subscription_payment error: {e}")
 
             if not result:
                 try:
                     if hasattr(payment_service, "create_pix_subscription"):
-                        result = payment_service.create_pix_subscription(user_id=db_user.id, amount=amount, description=description)
+                        result = payment_service.create_pix_subscription(user_id=db_user.id, **common_kwargs)
                     elif hasattr(payment_service, "create_pix_payment"):
-                        result = payment_service.create_pix_payment(user_id=db_user.id, amount=amount, description=description)
+                        result = payment_service.create_pix_payment(user_id=db_user.id, **common_kwargs)
                     elif hasattr(payment_service, "create_payment"):
-                        result = payment_service.create_payment(user_id=db_user.id, amount=amount, description=description, method="pix")
+                        result = payment_service.create_payment(user_id=db_user.id, **common_kwargs)
                 except Exception as e:
                     logger.error(f"payment_service fallback error: {e}")
                     result = {"error": str(e)}
@@ -6539,18 +6551,42 @@ def _extract_tg_id_from_payment(payment: dict) -> str:
     return ""
 
 def _activate_user_subscription(session, db_user, payment_id: str):
-    """Marca usuário como ativo por 30 dias e grava last_payment_id se disponível."""
+    """Marca usuário como ativo por 30 dias, grava last_payment_id e atualiza campos de expiração."""
     from datetime import datetime, timedelta
-    expires = datetime.now() + timedelta(days=30)
+    now = datetime.now()
+    expires = now + timedelta(days=30)
+
+    # Flags principais
     if hasattr(db_user, "is_trial"):
         db_user.is_trial = False
     if hasattr(db_user, "is_active"):
         db_user.is_active = True
-    for field in ["subscription_expires_at", "subscription_until", "premium_until", "paid_until", "expires_at"]:
+
+    # Alguns projetos usam plan_status/premium/etc
+    if hasattr(db_user, "plan_status"):
+        db_user.plan_status = "active"
+    if hasattr(db_user, "premium"):
+        db_user.premium = True
+    if hasattr(db_user, "subscription_started_at") and getattr(db_user, "subscription_started_at") is None:
+        db_user.subscription_started_at = now
+    if hasattr(db_user, "subscription_updated_at"):
+        db_user.subscription_updated_at = now
+
+    # Campos de expiração mais comuns (inclui next_due_date que seus menus usam)
+    for field in [
+        "next_due_date",
+        "subscription_expires_at",
+        "subscription_until",
+        "premium_until",
+        "paid_until",
+        "expires_at",
+    ]:
         if hasattr(db_user, field):
             setattr(db_user, field, expires)
+
     if hasattr(db_user, "last_payment_id"):
         db_user.last_payment_id = str(payment_id)
+
     session.commit()
     return expires
 
@@ -6724,6 +6760,16 @@ def mercadopago_webhook():
         return jsonify({"ok": False, "error": "unexpected"}), 200
 
 # ===== Inicialização do servidor Flask em thread separada =====
+
+# ===== Start Flask on import (single-run guard) =====
+__FLASK_WEBHOOK_STARTED = False
+
+def _log_routes():
+    try:
+        routes = [str(r) for r in getattr(app, "url_map", [])]
+        logger.info(f"[WEBHOOK] rotas Flask: {routes}")
+    except Exception:
+        pass
 def _run_flask():
     import os
     host = os.getenv("FLASK_HOST", "0.0.0.0")
@@ -6732,16 +6778,28 @@ def _run_flask():
         port = getattr(Config, "WEBHOOK_PORT", None) or int(os.getenv("PORT", "8080"))
     except Exception:
         port = int(os.getenv("PORT", "8080"))
+    _log_routes()
     logger.info(f"[WEBHOOK] Flask ouvindo em http://{host}:{port}/webhook/mercadopago")
-    # threaded=True para não bloquear; debug False em produção
-    app.run(host=host, port=port, threaded=True, debug=False)
+    try:
+        app.run(host=host, port=port, threaded=True, debug=False)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Flask app.run error: {e}")
 
-# Inicie esta thread junto com o bot (chame _start_flask_webhook() no bootstrap do seu app)
 def _start_flask_webhook():
+    global __FLASK_WEBHOOK_STARTED
+    if __FLASK_WEBHOOK_STARTED:
+        return
+    __FLASK_WEBHOOK_STARTED = True
     try:
         import threading
         t = threading.Thread(target=_run_flask, daemon=True)
         t.start()
     except Exception as e:
         logger.error(f"[WEBHOOK] falha ao iniciar Flask: {e}")
+
+# Start immediately to avoid missing early callbacks in some runners
+try:
+    _start_flask_webhook()
+except Exception as e:
+    logger.error(f"[WEBHOOK] auto-start failed: {e}")
 
