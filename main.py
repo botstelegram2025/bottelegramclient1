@@ -75,22 +75,6 @@ from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
-
-from flask import Flask, request, jsonify
-
-# ---- SAFE GUARD: ensure helper exists even if removed by merge ----
-if "_format_pix_copy_code" not in globals():
-    def _format_pix_copy_code(code: str, chunk: int = 36) -> str:
-        try:
-            s = str(code or "").strip()
-            if not s:
-                return ""
-            return "\n".join(s[i:i+chunk] for i in range(0, len(s), chunk))
-        except Exception:
-            return str(code)
-# ----------------------------------------------------------------------------
-
-
 # Conversation states
 WAITING_FOR_PHONE = 1
 WAITING_CLIENT_NAME = 2
@@ -273,7 +257,7 @@ def get_due_date_keyboard(months):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     if not update.effective_user:
-        return
+        return ConversationHandler.END
         
     user = update.effective_user
     
@@ -282,19 +266,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
             
             if db_user:
-                # Check if user is active
+                # User already exists - END conversation and show menu
+                logger.info(f"👤 EXISTING USER: {user.id} ({db_user.first_name}) using /start")
+                
                 if db_user.is_active:
                     await show_main_menu(update, context)
                 else:
-                    # User exists but inactive (trial expired)
                     await show_reactivation_screen(update, context)
+                    
+                # CRITICAL: End conversation for existing users
+                return ConversationHandler.END
             else:
+                # New user - start registration
+                logger.info(f"🆕 NEW USER: {user.id} starting registration")
                 return await start_registration(update, context)
                 
     except Exception as e:
         logger.error(f"Error in start command: {e}")
         if update.message:
             await update.message.reply_text("❌ Erro interno. Tente novamente.")
+        return ConversationHandler.END
 
 async def show_reactivation_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show payment options for expired trial users"""
@@ -352,38 +343,27 @@ Após o período de teste, a assinatura custa apenas R$ 20,00/mês.
 
 📱 Para continuar, preciso do seu número de telefone.
 Digite seu número com DDD (ex: 11999999999):
+
+🚫 **Digite /cancel para cancelar a qualquer momento**
 """
+    
+    logger.info(f"📝 REGISTRATION: Starting for new user {user.id}")
     
     if update.message:
         await update.message.reply_text(welcome_message, parse_mode='Markdown')
     return WAITING_FOR_PHONE
 
-# --- Accept Telegram contact during registration (minimal patch) ---
-async def handle_phone_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Aceita contato compartilhado pelo Telegram (update.message.contact.phone_number)
-    e reutiliza a lógica do handle_phone_number.
-    """
-    if not update.message or not update.message.contact:
-        if update.message:
-            await update.message.reply_text("❌ Não recebi um contato válido. Envie seu número ou compartilhe o contato.")
-        return WAITING_FOR_PHONE
-
-    contact_number = update.message.contact.phone_number or ""
-    # Reaproveita a validação existente: simula como se fosse texto
-    update.message.text = contact_number
-    return await handle_phone_number(update, context)
-
-
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone number input during registration (safe session usage)"""
+    """Handle phone number input during registration"""
     if not update.effective_user or not update.message:
         return ConversationHandler.END
-
+        
     user = update.effective_user
+    
     logger.info(f"🔄 REGISTRATION: Processing phone number for user {user.id}")
-
     phone_number = update.message.text or ""
+    
+    # Validate and normalize phone number
     normalized_phone = normalize_brazilian_phone(phone_number)
     if len(normalized_phone) < 10 or len(normalized_phone) > 11:
         await update.message.reply_text(
@@ -391,51 +371,33 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown'
         )
         return WAITING_FOR_PHONE
-
+    
     clean_phone = normalized_phone
-
-    # Prepare locals to avoid using ORM instance outside session
-    trial_start = datetime.utcnow()
-    trial_end = trial_start + timedelta(days=7)
-    trial_end_str = trial_end.strftime('%d/%m/%Y às %H:%M')
-    new_user_id = None
-
+    
     try:
-        with db_service.get_session() as session:
-            existing_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
-            if existing_user:
-                logger.warning(f"User {user.id} already exists")
-                await update.message.reply_text("❌ Usuário já cadastrado. Use /start para acessar o menu.")
-                return ConversationHandler.END
-
-            new_user = User(
-                telegram_id=str(user.id),
-                first_name=user.first_name or 'Usuário',
-                last_name=user.last_name or '',
-                username=user.username or '',
-                phone_number=clean_phone,
-                trial_start_date=trial_start,
-                trial_end_date=trial_end,
-                is_trial=True,
-                is_active=True
-            )
-            session.add(new_user)
-            session.flush()
-            new_user_id = new_user.id
-            session.commit()
-
-        # Create defaults in a new session (avoid stale bindings)
-        if new_user_id:
-            try:
-                await create_default_templates_in_db(new_user_id)
-            except Exception as e:
-                logger.error(f"Error creating templates for user {new_user_id}: {e}")
-
+        logger.info(f"Starting user registration for telegram_id: {user.id}")
+        
+        # Create user data outside session first
+        trial_start = datetime.utcnow()
+        trial_end = trial_start + timedelta(days=7)
+        user_data = {
+            'telegram_id': str(user.id),
+            'first_name': user.first_name or 'Usuário',
+            'last_name': user.last_name or '',
+            'username': user.username or '',
+            'phone_number': clean_phone,
+            'trial_start_date': trial_start,
+            'trial_end_date': trial_end,
+            'is_trial': True,
+            'is_active': True
+        }
+        
+        # Create success message beforehand
         success_message = f"""
 ✅ **Cadastro realizado com sucesso!**
 
 🆓 Seu período de teste de 7 dias já começou!
-📅 Válido até: {trial_end_str}
+📅 Válido até: {trial_end.strftime('%d/%m/%Y às %H:%M')}
 
 🚀 **Próximos passos:**
 1. Cadastre seus primeiros clientes
@@ -444,18 +406,71 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 Use o teclado abaixo para começar:
 """
+        
+        new_user_id = None
+        
+        with db_service.get_session() as session:
+            # Check if user already exists
+            existing_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            if existing_user:
+                logger.warning(f"User {user.id} already exists")
+                await update.message.reply_text("❌ Usuário já cadastrado. Use /start para acessar o menu.")
+                return ConversationHandler.END
+            
+            logger.info(f"Creating new user record...")
+            
+            # Create new user
+            new_user = User(**user_data)
+            session.add(new_user)
+            session.flush()  # Get the ID
+            new_user_id = new_user.id
+            session.commit()
+            
+            logger.info(f"User record created with ID: {new_user_id}")
+        
+        # Create templates outside session
+        logger.info(f"Creating templates for user {new_user_id}...")
+        try:
+            template_result = await create_default_templates_in_db(new_user_id)
+            logger.info(f"Templates created for user {new_user_id}")
+        except Exception as e:
+            logger.error(f"Template creation error for user {new_user_id}: {e}")
+            # Continue anyway
+        
+        logger.info(f"✅ REGISTRATION: Completed successfully for user {new_user_id}")
+        
+        # Send success messages
         await update.message.reply_text(success_message, parse_mode='Markdown')
-        await show_main_menu(update, context)
+        
+        # Get user object for proper keyboard with trial buttons
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(id=new_user_id).first()
+            reply_markup = get_main_keyboard(db_user)
+            
+        await update.message.reply_text(
+            "🏠 **Menu Principal**\n\n🆓 **Período de teste ativo!**\nVocê tem acesso a todas as funcionalidades:\n\n👥 **Clientes** - Gerencie seus clientes\n📊 **Dashboard** - Veja estatísticas\n📝 **Templates** - Personalize mensagens\n⏰ **Horários** - Configure lembretes\n📱 **WhatsApp** - Conecte sua conta\n🚀 **Pagamento Antecipado** - Garanta acesso permanente",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+        logger.info(f"🔚 REGISTRATION: ConversationHandler.END returned for user {new_user_id}")
         return ConversationHandler.END
-
+            
     except Exception as e:
         logger.error(f"CRITICAL ERROR during user registration for {user.id}: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error details: {str(e)}")
+        
+        # Try to provide more specific error message
         error_msg = "❌ Erro ao cadastrar. "
         if "duplicate" in str(e).lower() or "unique" in str(e).lower():
             error_msg += "Usuário já existe. Use /start para acessar."
         else:
             error_msg += "Tente novamente em alguns segundos."
+            
         await update.message.reply_text(error_msg)
+        
+        logger.error(f"🔁 REGISTRATION: Staying in WAITING_FOR_PHONE due to error")
         return WAITING_FOR_PHONE
 
 async def force_process_reminders_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -512,58 +527,56 @@ async def force_process_reminders_today(update: Update, context: ContextTypes.DE
         await update.message.reply_text("❌ Erro ao processar lembretes. Tente novamente.")
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show the main menu safely, without assuming created_at is populated."""
+    """Show main menu to user"""
     if not update.effective_user:
         return
+        
     user = update.effective_user
+    
     try:
         with db_service.get_session() as session:
             db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
             if not db_user:
                 if update.message:
                     await update.message.reply_text("❌ Usuário não encontrado.")
                 return
-
-            # Compute status text safely
-            status_text = "💎 Premium"
-            trial_info = ""
-            if getattr(db_user, "is_trial", False):
-                status_text = "🎁 Teste"
-                # Prefer trial_end_date when present
-                days_left = 0
-                try:
-                    if getattr(db_user, "trial_end_date", None):
-                        from datetime import datetime as _dt
-                        days_left = max(0, (db_user.trial_end_date.date() - _dt.utcnow().date()).days)
-                except Exception as _e:
-                    days_left = 0
-                if days_left:
-                    trial_info = f" ({days_left} dias restantes)"
-
+            
+            # Get trial info
+            trial_days_left = 0
+            if db_user.is_trial:
+                # Calculate trial days based on created_at + 7 days
+                trial_end = db_user.created_at.date() + timedelta(days=7)
+                trial_days_left = max(0, (trial_end - datetime.utcnow().date()).days)
+            
+            status_text = "🎁 Teste" if db_user.is_trial else "💎 Premium"
+            if db_user.is_trial:
+                status_text += f" ({trial_days_left} dias restantes)"
+            
             menu_text = f"""
 🏠 **Menu Principal**
 
 👋 Olá, {user.first_name}!
 
-📊 **Status:** {status_text}{trial_info}
-{'⚠️ Conta inativa' if not getattr(db_user, 'is_active', True) else '✅ Conta ativa'}
+📊 **Status:** {status_text}
+{'⚠️ Conta inativa' if not db_user.is_active else '✅ Conta ativa'}
 
 O que deseja fazer?
 """
+            
             reply_markup = get_main_keyboard(db_user)
+            
             if update.message:
                 await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
             elif update.callback_query:
                 await update.callback_query.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+                
     except Exception as e:
         logger.error(f"Error showing main menu: {e}")
-        try:
-            if update.message:
-                await update.message.reply_text("✅ Cadastro concluído! Use o menu abaixo para continuar.", reply_markup=get_main_keyboard())
-            elif update.callback_query and update.callback_query.message:
-                await update.callback_query.message.reply_text("✅ Cadastro concluído! Use o menu abaixo para continuar.", reply_markup=get_main_keyboard())
-        except Exception as _:
-            pass
+        if update.message:
+            await update.message.reply_text("❌ Erro ao carregar menu.")
+        elif update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text("❌ Erro ao carregar menu.")
 
 async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle dashboard callback"""
@@ -756,6 +769,201 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Error showing dashboard: {e}")
         await query.edit_message_text("❌ Erro ao carregar dashboard.")
+
+async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle subscription payment flow"""
+    if not update.callback_query or not update.callback_query.from_user:
+        return
+        
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    try:
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user:
+                await query.edit_message_text("❌ Usuário não encontrado.")
+                return
+            
+            # Import payment service
+            from services.payment_service import payment_service
+            
+            # Create PIX payment
+            payment_result = payment_service.create_subscription_payment(db_user.id)
+            
+            if payment_result and payment_result.get('success'):
+                payment_data = payment_result.get('data', payment_result)
+                
+                # Save payment in database for automatic verification
+                from models import Subscription
+                subscription = Subscription(
+                    user_id=db_user.id,
+                    payment_id=payment_data.get('payment_id'),
+                    amount=payment_data.get('amount', 20.00),
+                    status='pending',
+                    payment_method='pix',
+                    pix_qr_code=payment_data.get('qr_code'),
+                    pix_qr_code_base64=payment_data.get('qr_code_base64'),
+                    expires_at=datetime.strptime(payment_data.get('expires_at'), '%Y-%m-%dT%H:%M:%S.000%z') if payment_data.get('expires_at') else None
+                )
+                session.add(subscription)
+                session.commit()
+                
+                logger.info(f"💾 Payment saved for automatic verification: {payment_data.get('payment_id')} for user {user.id}")
+                
+                message = f"""
+💳 **Pagamento PIX Gerado**
+
+💰 **Valor:** R$ {payment_data.get('amount', 20.00):.2f}
+📅 **Assinatura:** Mensal
+⏰ **Válido até:** {payment_data.get('expires_at', 'N/A')}
+
+📋 **Instruções:**
+1. Copie o código PIX abaixo
+2. Cole no seu app do banco
+3. Confirme o pagamento
+
+🔗 **Código PIX:**
+`{payment_data.get('qr_code', 'Erro ao gerar PIX')}`
+
+⚡ **Ativação automática em até 5 minutos!**
+"""
+                
+                keyboard = [
+                    [InlineKeyboardButton("🔄 Verificar Pagamento", callback_data=f"check_payment_{payment_data.get('payment_id')}")],
+                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                
+                logger.info(f"💳 PIX payment created for user {user.id}: {payment_data.get('id')}")
+                
+            else:
+                error_msg = payment_result.get('error', 'Erro desconhecido') if payment_result else 'Erro no serviço de pagamento'
+                await query.edit_message_text(
+                    f"❌ **Erro ao gerar pagamento PIX**\n\n{error_msg}\n\nTente novamente em alguns instantes."
+                )
+                logger.error(f"Failed to create PIX payment for user {user.id}: {error_msg}")
+                
+    except Exception as e:
+        logger.error(f"Error in subscribe_now_callback: {e}")
+        await query.edit_message_text("❌ Erro interno ao processar pagamento.")
+
+async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle payment verification"""
+    if not update.callback_query or not update.callback_query.from_user:
+        return
+        
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    try:
+        # Extract payment ID from callback data
+        callback_data = query.data
+        payment_id = callback_data.replace("check_payment_", "")
+        
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user:
+                await query.edit_message_text("❌ Usuário não encontrado.")
+                return
+            
+            # Import payment service
+            from services.payment_service import payment_service
+            
+            # Check payment status
+            payment_status = payment_service.check_payment_status(payment_id)
+            
+            if payment_status and payment_status.get('success'):
+                status = payment_status.get('status')
+                
+                if status == 'approved':
+                    # Payment approved - activate user
+                    db_user.is_active = True
+                    db_user.subscription_status = 'active'
+                    db_user.next_due_date = date.today() + timedelta(days=30)
+                    session.commit()
+                    
+                    message = f"""
+🎉 **PAGAMENTO APROVADO!**
+
+✅ Sua assinatura foi ativada com sucesso!
+
+📊 **Status:** Premium Ativo
+📅 **Próximo vencimento:** {db_user.next_due_date.strftime('%d/%m/%Y')}
+
+🚀 **Agora você tem acesso a:**
+• Gestão ilimitada de clientes
+• Lembretes automáticos via WhatsApp  
+• Controle de vencimentos
+• Relatórios detalhados
+• Suporte prioritário
+
+Bem-vindo ao plano Premium! 🎯
+"""
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("🏠 Ir para Menu", callback_data="main_menu")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await query.edit_message_text(
+                        message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                    
+                    logger.info(f"✅ Payment approved for user {user.id}, subscription activated")
+                    
+                elif status in ['pending', 'in_process']:
+                    await query.edit_message_text(
+                        "⏳ **Pagamento Pendente**\n\n"
+                        "Ainda não identificamos seu pagamento.\n"
+                        "Pode levar até 5 minutos para processar.\n\n"
+                        "Clique em 'Verificar' novamente em alguns instantes.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Verificar Novamente", callback_data=f"check_payment_{payment_id}")],
+                            [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+                        ])
+                    )
+                    
+                else:
+                    await query.edit_message_text(
+                        f"❌ **Pagamento não aprovado**\n\n"
+                        f"Status: {status}\n\n"
+                        "Se você já fez o pagamento, aguarde alguns minutos e tente verificar novamente.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Verificar Novamente", callback_data=f"check_payment_{payment_id}")],
+                            [InlineKeyboardButton("💳 Novo Pagamento", callback_data="subscribe_now")],
+                            [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+                        ])
+                    )
+                    
+            else:
+                error_msg = payment_status.get('error', 'Erro ao verificar pagamento') if payment_status else 'Erro no serviço de pagamento'
+                await query.edit_message_text(
+                    f"❌ **Erro na verificação**\n\n{error_msg}\n\nTente novamente.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Tentar Novamente", callback_data=f"check_payment_{payment_id}")],
+                        [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+                    ])
+                )
+                logger.error(f"Error checking payment {payment_id} for user {user.id}: {error_msg}")
+                
+    except Exception as e:
+        logger.error(f"Error in check_payment_callback: {e}")
+        await query.edit_message_text("❌ Erro interno ao verificar pagamento.")
 
 async def manage_clients_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manage clients callback"""
@@ -1590,329 +1798,6 @@ async def subscription_info_callback(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logger.error(f"Error showing subscription info: {e}")
         await query.edit_message_text("❌ Erro ao carregar informações da assinatura.")
-
-
-
-# === PIX / Assinatura ===
-
-# === PIX / Assinatura — compatível com create_subscription_payment ===
-
-async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia pagamento via PIX e envia:
-       1) QR Code (foto)
-       2) Código copia-e-cola (mensagem separada, texto puro)
-       3) Instruções e link (texto puro)
-    """
-    if not update.callback_query:
-        return
-
-    q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
-
-    try:
-        with db_service.get_session() as session:
-            tg_user = q.from_user
-            db_user = session.query(User).filter_by(telegram_id=str(tg_user.id)).first()
-            if not db_user:
-                try:
-                    await q.edit_message_text("❌ Usuário não encontrado. Use /start para se registrar.")
-                except Exception:
-                    pass
-                return
-
-            amount = getattr(Config, "MONTHLY_SUBSCRIPTION_PRICE", 20.00) or 20.00
-            description = "Assinatura Mensal - Bot Gestor"
-
-            # Tentativas de criação do pagamento
-            result = None
-            tgid_str = str(tg_user.id)
-            external_ref = f"telegram_bot_{tgid_str}_{int(__import__('time').time())}"
-            common_kwargs = {
-                "amount": amount,
-                "description": description,
-                "external_reference": external_ref,
-                "metadata": {"telegram_id": tgid_str},
-                "method": "pix",
-            }
-
-            try:
-                if hasattr(payment_service, "create_subscription_payment"):
-                    try:
-                        result = payment_service.create_subscription_payment(
-                            user_telegram_id=tgid_str, **common_kwargs
-                        )
-                    except TypeError:
-                        try:
-                            result = payment_service.create_subscription_payment(tgid_str, amount)
-                        except Exception:
-                            pass
-            except Exception as e:
-                logger.error(f"create_subscription_payment error: {e}")
-
-            if not result:
-                try:
-                    if hasattr(payment_service, "create_pix_subscription"):
-                        result = payment_service.create_pix_subscription(user_id=db_user.id, **common_kwargs)
-                    elif hasattr(payment_service, "create_pix_payment"):
-                        result = payment_service.create_pix_payment(user_id=db_user.id, **common_kwargs)
-                    elif hasattr(payment_service, "create_payment"):
-                        result = payment_service.create_payment(user_id=db_user.id, **common_kwargs)
-                except Exception as e:
-                    logger.error(f"payment_service fallback error: {e}")
-                    result = {"error": str(e)}
-
-            raw = result or {}
-
-            # Extract normalized fields
-            def g(d, path, default=None):
-                cur = d
-                for part in path.split("."):
-                    if not isinstance(cur, dict) or part not in cur:
-                        return default
-                    cur = cur[part]
-                return cur
-
-            tx = g(raw, "point_of_interaction.transaction_data", {}) or {}
-
-            qr_b64 = (
-                raw.get("qr_code_base64")
-                or raw.get("qrCodeBase64")
-                or tx.get("qr_code_base64")
-                or tx.get("qr_code_base64_image")
-                or g(raw, "transaction_data.qr_code_base64")
-            )
-
-            copia = (
-                raw.get("copy_paste")
-                or raw.get("copia_cola")
-                or raw.get("pix_code")
-                or raw.get("qr_code")  # alias
-                or tx.get("qr_code")
-                or g(raw, "transaction_data.qr_code")
-            )
-
-            link = (
-                raw.get("payment_link")
-                or raw.get("checkout_url")
-                or tx.get("ticket_url")
-                or tx.get("url")
-                or raw.get("init_point")
-            )
-
-            # 0) Informe curto na mensagem original (não travar se falhar)
-            try:
-                await q.edit_message_text("✅ Enviamos abaixo as instruções e o QR Code/PIX.")
-            except Exception as e:
-                logger.error(f"edit original msg failed: {e}")
-
-            # 1) QR Code (se houver)
-            if qr_b64:
-                try:
-                    import base64, io
-                    if isinstance(qr_b64, str) and qr_b64.startswith("data:image"):
-                        qr_b64 = qr_b64.split(",")[1]
-                    qr_bytes = base64.b64decode(qr_b64) if isinstance(qr_b64, str) else qr_b64
-                    qr_photo = io.BytesIO(qr_bytes); qr_photo.name = "pix_qr_code.png"
-                    await context.bot.send_photo(
-                        chat_id=q.message.chat_id,
-                        photo=qr_photo,
-                        caption="📲 QR Code PIX\nEscaneie para pagar.",
-                        parse_mode=None
-                    )
-                except Exception as e:
-                    logger.error(f"send_photo failed: {e}")
-
-            # 2) Copia-e-cola (sempre texto puro)
-            if copia:
-                try:
-                    pretty = _format_pix_copy_code(copia)
-                    await context.bot.send_message(
-                        chat_id=q.message.chat_id,
-                        text="📋 Copia e Cola PIX:\n```\n" + str(copia) + "\n```",
-                        parse_mode="MarkdownV2"
-                    )
-                except Exception as e:
-                    logger.error(f"send copy-paste failed: {e}")
-
-            # 3) Instruções + link (texto puro)
-            try:
-                parts = [
-                    "💳 Pagamento da Assinatura (PIX)",
-                    f"Valor: R$ {amount:.2f}",
-                    "",
-                    "Pague usando uma das opções:"
-                ]
-                if link:
-                    parts.append(f"Link de pagamento:\n{link}")
-                await context.bot.send_message(
-                    chat_id=q.message.chat_id,
-                    text="\n".join(parts),
-                    parse_mode=None,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]])
-                )
-            except Exception as e:
-                logger.error(f"send instructions failed: {e}")
-
-            return
-
-    except Exception as e:
-        logger.error(f"subscribe_now_callback fatal error: {e}")
-        try:
-            await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
-        except Exception:
-            pass
-
-            def get_nested(d, path, default=None):
-                cur = d
-                for p in path.split("."):
-                    if not isinstance(cur, dict) or p not in cur:
-                        return default
-                    cur = cur[p]
-                return cur
-
-            # Mercado Pago clássico
-            mp_tx = get_nested(raw, "point_of_interaction.transaction_data", {}) or {}
-
-            # QR base64 (imagem)
-            qr_b64 = (
-                raw.get("qr_code_base64")
-                or raw.get("qrCodeBase64")
-                or mp_tx.get("qr_code_base64")
-                or mp_tx.get("qr_code_base64_image")
-                or get_nested(raw, "transaction_data.qr_code_base64")
-            )
-
-            # Código copia-e-cola (alguns serviços chamam de qr_code)
-            copia_cola = (
-                raw.get("copy_paste")
-                or raw.get("copia_cola")
-                or raw.get("pix_code")
-                or mp_tx.get("qr_code")
-                or raw.get("qr_code")  # <-- importante p/ versões antigas
-                or get_nested(raw, "transaction_data.qr_code")
-            )
-
-            # Link opcional
-            pay_link = (
-                raw.get("payment_link")
-                or raw.get("checkout_url")
-                or get_nested(raw, "point_of_interaction.transaction_data.ticket_url")
-                or get_nested(raw, "point_of_interaction.transaction_data.url")
-                or raw.get("init_point")
-            )
-
-            payment_id = (
-                raw.get("payment_id")
-                or raw.get("id")
-                or raw.get("preference_id")
-                or get_nested(raw, "transaction_data.external_reference")
-            )
-
-            # Heurística de sucesso: se veio QUALQUER um dos 3, já consideramos OK
-            success = bool(qr_b64 or copia_cola or pay_link)
-
-            # Loga chaves para diagnóstico (sem expor valores)
-            try:
-                if isinstance(raw, dict):
-                    logger.info(f"[PIX] keys={list(raw.keys())}")
-                    if isinstance(mp_tx, dict):
-                        logger.info(f"[PIX] mp_tx.keys={list(mp_tx.keys())}")
-            except Exception:
-                pass
-
-            if success:
-                # Monta texto
-                text = [
-                    "💳 **Pagamento da Assinatura (PIX)**",
-                    f"💰 Valor: **R$ {amount:.2f}**",
-                    "",
-                    "🧾 Pague usando **uma** das opções abaixo:"
-                ]
-                if pay_link:
-                    text.append(f"🔗 Link de pagamento:\n{pay_link}")
-                if copia_cola:
-                    text.extend(["", "📋 **Copia e Cola PIX:**", f"`{copia_cola}`"])
-
-                keyboard = [[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]
-
-                # Envia QR se base64 presente
-                if qr_b64:
-                    try:
-                        import base64, io
-                        if isinstance(qr_b64, str) and qr_b64.startswith("data:image"):
-                            qr_b64 = qr_b64.split(",")[1]
-                        qr_bytes = base64.b64decode(qr_b64) if isinstance(qr_b64, str) else qr_b64
-                        qr_photo = io.BytesIO(qr_bytes)
-                        qr_photo.name = "pix_qr_code.png"
-                        await context.bot.send_photo(
-                            chat_id=query.message.chat_id,
-                            photo=qr_photo,
-                            caption="📲 **QR Code PIX**\nEscaneie para pagar.",
-                            parse_mode="Markdown"
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar QR: {e}")
-
-                await query.edit_message_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-                return
-
-            # ---- Fallback (nada veio)
-            fallback_text = (
-    "⚠️ **Pagamento PIX indisponível no momento.**\n\n"
-    "Verifique se o método `create_subscription_payment` está sendo chamado e se o token do Mercado Pago está definido.\n"
-    "Toque em **Menu Principal** e tente novamente mais tarde."
-)
-            await query.edit_message_text(
-                fallback_text,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                parse_mode="Markdown"
-            )
-
-    except Exception as e:
-        logger.error(f"subscribe_now_callback error: {e}")
-        await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
-
-async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Opcional) Verificar status do pagamento se suportado."""
-    if not update.callback_query:
-        return
-    query = update.callback_query
-    await query.answer()
-
-    payment_id = None
-    try:
-        data = query.data or ""
-        if data.startswith("check_payment_"):
-            payment_id = data.replace("check_payment_", "").strip()
-
-        status = None
-        if payment_id and hasattr(payment_service, "check_payment_status"):
-            status = payment_service.check_payment_status(payment_id)
-
-        if status and status.get("paid"):
-            await query.edit_message_text(
-                "✅ **Pagamento confirmado!** Sua assinatura foi ativada.\n\n"
-                "Toque em **Menu Principal** para continuar.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text(
-                "⏳ Pagamento ainda **não confirmado**.\n\nTente novamente em alguns instantes.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Tentar novamente", callback_data=query.data)],
-                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")],
-                ]),
-                parse_mode="Markdown"
-            )
-    except Exception as e:
-        logger.error(f"check_payment_callback error: {e}")
-        await query.edit_message_text("❌ Erro ao verificar pagamento.")
-
-
 
 async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle WhatsApp status callback and show QR code if needed"""
@@ -5434,16 +5319,25 @@ def main():
         # Create application
         application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
         
+        # Cancel command handler
+        async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Cancel any ongoing conversation"""
+            if update.effective_user:
+                logger.info(f"🚫 CANCEL: User {update.effective_user.id} cancelled conversation")
+                await update.message.reply_text("❌ Operação cancelada. Use /start para começar novamente.")
+            return ConversationHandler.END
+        
         # Register conversation handlers
         user_registration_handler = ConversationHandler(
             entry_points=[CommandHandler("start", start_command)],
             states={
-                WAITING_FOR_PHONE: [
-                MessageHandler(filters.CONTACT, handle_phone_contact),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_number)
-            ]
+                WAITING_FOR_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_number)]
             },
-            fallbacks=[CommandHandler("start", start_command)],
+            fallbacks=[
+                CommandHandler("start", start_command),
+                CommandHandler("cancel", cancel_command),
+                MessageHandler(filters.COMMAND, cancel_command)  # Any other command cancels
+            ],
             per_message=False
         )
         
@@ -5598,7 +5492,7 @@ def main():
         
         # Template handlers already implemented above - no external imports needed
         
-        # Payment system handlers - disabled temporarily (functions need to be implemented)
+        # Payment system handlers
         application.add_handler(CallbackQueryHandler(subscribe_now_callback, pattern="^subscribe_now$"))
         application.add_handler(CallbackQueryHandler(check_payment_callback, pattern="^check_payment_.*$"))
 
@@ -6523,295 +6417,3 @@ async def disable_reminders_callback(update: Update, context: ContextTypes.DEFAU
 
 if __name__ == '__main__':
     main()
-
-
-# ===== Mercado Pago Webhook (Flask) =====
-app = Flask(__name__)
-# Tornar compatível com / e sem /
-try:
-    app.url_map.strict_slashes = False
-except Exception:
-    pass
-
-def _extract_tg_id_from_payment(payment: dict) -> str:
-    """Extrai o telegram_id do external_reference/description/metadata."""
-    if not isinstance(payment, dict):
-        return ""
-    import re as _re
-    ext = payment.get("external_reference") or payment.get("external_reference_id") or ""
-    # padrão usado: telegram_bot_<telegram_id>_<timestamp>
-    m = _re.search(r"telegram_bot_(\d+)_", str(ext))
-    if m:
-        return m.group(1)
-    # tentar metadata
-    md = payment.get("metadata") or {}
-    for k in ("telegram_id", "telegram_user_id", "tg_id"):
-        v = md.get(k)
-        if v:
-            return str(v)
-    # tentar na description (se houver)
-    m2 = _re.search(r"telegram[_\s-]?id[:\s-]?(\d+)", str(payment.get("description") or ""), flags=_re.I)
-    if m2:
-        return m2.group(1)
-    return ""
-
-def _activate_user_subscription(session, db_user, payment_id: str):
-    """Marca usuário como ativo por 30 dias, grava last_payment_id e atualiza campos de expiração."""
-    from datetime import datetime, timedelta
-    now = datetime.now()
-    expires = now + timedelta(days=30)
-
-    # Flags principais
-    if hasattr(db_user, "is_trial"):
-        db_user.is_trial = False
-    if hasattr(db_user, "is_active"):
-        db_user.is_active = True
-
-    # Alguns projetos usam plan_status/premium/etc
-    if hasattr(db_user, "plan_status"):
-        db_user.plan_status = "active"
-    if hasattr(db_user, "premium"):
-        db_user.premium = True
-    if hasattr(db_user, "subscription_started_at") and getattr(db_user, "subscription_started_at") is None:
-        db_user.subscription_started_at = now
-    if hasattr(db_user, "subscription_updated_at"):
-        db_user.subscription_updated_at = now
-
-    # Campos de expiração mais comuns (inclui next_due_date que seus menus usam)
-    for field in [
-        "next_due_date",
-        "subscription_expires_at",
-        "subscription_until",
-        "premium_until",
-        "paid_until",
-        "expires_at",
-    ]:
-        if hasattr(db_user, field):
-            setattr(db_user, field, expires)
-
-    if hasattr(db_user, "last_payment_id"):
-        db_user.last_payment_id = str(payment_id)
-
-    session.commit()
-    return expires
-
-def _notify_user_paid(bot, chat_id: int, expires):
-    try:
-        bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "✅ Pagamento confirmado automaticamente!\n"
-                f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}"
-            ),
-            parse_mode=None,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-        )
-    except Exception as e:
-        logger.error(f"[WEBHOOK] erro ao notificar usuário: {e}")
-
-def _get_telegram_bot_instance():
-    from telegram import Bot
-    from config import Config
-    token = getattr(Config, "TELEGRAM_BOT_TOKEN", None) or getattr(Config, "BOT_TOKEN", None) or getattr(Config, "TELEGRAM_TOKEN", None)
-    if not token:
-        logger.error("[WEBHOOK] Token do Telegram não encontrado em Config.")
-        return None
-    try:
-        return Bot(token)
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Falha ao instanciar Bot: {e}")
-        return None
-
-
-
-@app.route("/webhook/mercadopago", methods=["POST", "GET"])
-@app.route("/webhook/mercadopago/", methods=["POST", "GET"])
-def mercadopago_webhook():
-    """Webhook do Mercado Pago. Aceita payload JSON e também querystring (id/topic, data.id/type)."""
-    try:
-        # 1) Extrai payment_id de forma resiliente
-        payment_id = None
-        payload = request.get_json(silent=True) or {}
-
-        # a) JSON padrão: {"type":"payment","data":{"id":"123"}}
-        if isinstance(payload, dict):
-            if payload.get("type") in {"payment", "payments"} and isinstance(payload.get("data"), dict):
-                payment_id = payload["data"].get("id") or payment_id
-            # b) Recurso: {"resource": ".../payments/123"}
-            res = payload.get("resource")
-            if not payment_id and isinstance(res, str) and "/payments/" in res:
-                import re as _re
-                m = _re.search(r"/payments/(\d+)", res)
-                if m:
-                    payment_id = m.group(1)
-
-        # c) Querystring: ?id=...&topic=payment
-        if not payment_id:
-            payment_id = request.args.get("id") or payment_id
-
-        # d) Querystring alternativa: ?data.id=...&type=payment
-        if not payment_id:
-            payment_id = request.args.get("data.id") or payment_id
-
-        # e) Fallback por formulário
-        if not payment_id and request.form:
-            payment_id = request.form.get("id") or request.form.get("data.id")
-
-        if not payment_id:
-            logger.error(f"[WEBHOOK] sem payment_id - payload={payload} args={dict(request.args)} form={dict(request.form)}")
-            return jsonify({"ok": False, "error": "missing_payment_id"}), 200
-
-        logger.info(f"[WEBHOOK] recebido payment_id={payment_id}")
-
-        # 2) Confirma status no MP e extrai telegram_id
-        status = payment_service.check_payment_status(str(payment_id))
-        if not status.get("success"):
-            logger.error(f"[WEBHOOK] status lookup falhou: {status}")
-            return jsonify({"ok": False, "error": "status_lookup_failed"}), 200
-
-        paid = bool(status.get("paid")) or (status.get("status") == "approved")
-        payment_raw = status.get("raw") or {}
-        tg_id = status.get("telegram_id")
-
-        if not tg_id:
-            tg_id = _extract_tg_id_from_payment(payment_raw)
-
-        if paid and tg_id:
-            try:
-                with db_service.get_session() as session:
-                    db_user = session.query(User).filter_by(telegram_id=str(tg_id)).first()
-                    if not db_user:
-                        logger.error(f"[WEBHOOK] usuário não encontrado para telegram_id={tg_id}")
-                        return jsonify({"ok": True, "warn": "user_not_found"}), 200
-
-                    expires = _activate_user_subscription(session, db_user, str(payment_id))
-
-                # Notifica via Telegram HTTP
-                try:
-                    from config import Config as _Cfg
-                    token = getattr(_Cfg, "TELEGRAM_BOT_TOKEN", None) or getattr(_Cfg, "BOT_TOKEN", None)
-                    if token:
-                        import requests
-                        url = f"https://api.telegram.org/bot{token}/sendMessage"
-                        data = {
-                            "chat_id": int(tg_id),
-                            "text": "✅ Pagamento confirmado automaticamente!\n" +
-                                    f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}",
-                            "parse_mode": "HTML",
-                            "reply_markup": '{"inline_keyboard":[[{"text":"🏠 Menu Principal","callback_data":"main_menu"}]]}',
-                        }
-                        r = requests.post(url, json=data, timeout=10)
-                        logger.info(f"[WEBHOOK] telegram notify status={r.status_code}")
-                    else:
-                        logger.error("[WEBHOOK] TELEGRAM_BOT_TOKEN ausente; notificação não enviada.")
-                except Exception as e:
-                    logger.error(f"[WEBHOOK] erro ao notificar por HTTP: {e}")
-
-                return jsonify({"ok": True, "status": "approved"}), 200
-            except Exception as e:
-                logger.error(f"[WEBHOOK] erro ao ativar assinatura: {e}")
-                return jsonify({"ok": False, "error": "db_error"}), 200
-
-        logger.info(f"[WEBHOOK] não aprovado ainda: id={payment_id} status={status.get('status')}")
-        return jsonify({"ok": True, "status": status.get("status")}), 200
-
-    except Exception as e:
-        logger.error(f"[WEBHOOK] erro inesperado: {e}")
-        return jsonify({"ok": False, "error": "unexpected"}), 200
-
-
-        if not result.get("success"):
-            logger.error(f"[WEBHOOK] payload inválido/sem payment_id: {payload}")
-            return jsonify({"ok": False, "error": "invalid", "details": result}), 200
-
-        payment_id = result.get("payment_id")
-        status = result.get("status")
-        paid = result.get("paid") or (status == "approved")
-        payment_raw = result.get("raw") or {}
-        tg_id = result.get("telegram_id")
-
-        # Fallback: tenta extrair do payment bruto
-        if not tg_id:
-            tg_id = _extract_tg_id_from_payment(payment_raw)
-
-        if paid and tg_id:
-            try:
-                with db_service.get_session() as session:
-                    db_user = session.query(User).filter_by(telegram_id=str(tg_id)).first()
-                    if not db_user:
-                        logger.error(f"[WEBHOOK] usuário não encontrado para telegram_id={tg_id}")
-                        return jsonify({"ok": True, "warn": "user_not_found"}), 200
-
-                    expires = _activate_user_subscription(session, db_user, str(payment_id))
-
-                # Notifica usuário
-                bot = _get_telegram_bot_instance()
-                if bot:
-                    _notify_user_paid(bot, int(tg_id), expires)
-                else:
-                    logger.error("[WEBHOOK] Bot não pode ser instanciado; notificação pulada.")
-
-                return jsonify({"ok": True, "status": "approved"}), 200
-
-            except Exception as e:
-                logger.error(f"[WEBHOOK] erro ao ativar assinatura: {e}")
-                return jsonify({"ok": False, "error": "db_error"}), 200
-
-        # Caso não aprovado ainda
-        logger.info(f"[WEBHOOK] pagamento ainda não aprovado: id={payment_id} status={status}")
-        return jsonify({"ok": True, "status": status}), 200
-
-    except Exception as e:
-        logger.error(f"[WEBHOOK] erro inesperado: {e}")
-        return jsonify({"ok": False, "error": "unexpected"}), 200
-
-# ===== Inicialização do servidor Flask em thread separada =====
-
-# Pequena rota de saúde para testar no navegador/MP
-@app.route("/health", methods=["GET"])  
-def health():
-    from datetime import datetime
-    return jsonify({"ok": True, "status": "healthy", "ts": datetime.now().isoformat()}), 200
-
-# ===== Start Flask on import (single-run guard) =====
-__FLASK_WEBHOOK_STARTED = False
-
-def _log_routes():
-    try:
-        routes = [str(r) for r in getattr(app, "url_map", [])]
-        logger.info(f"[WEBHOOK] rotas Flask: {routes}")
-    except Exception:
-        pass
-def _run_flask():
-    import os
-    host = os.getenv("FLASK_HOST", "0.0.0.0")
-    try:
-        from config import Config
-        port = getattr(Config, "WEBHOOK_PORT", None) or int(os.getenv("PORT", "8080"))
-    except Exception:
-        port = int(os.getenv("PORT", "8080"))
-    _log_routes()
-    logger.info(f"[WEBHOOK] Flask ouvindo em http://{host}:{port}/webhook/mercadopago")
-    try:
-        app.run(host=host, port=port, threaded=True, debug=False)
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Flask app.run error: {e}")
-
-def _start_flask_webhook():
-    global __FLASK_WEBHOOK_STARTED
-    if __FLASK_WEBHOOK_STARTED:
-        return
-    __FLASK_WEBHOOK_STARTED = True
-    try:
-        import threading
-        t = threading.Thread(target=_run_flask, daemon=True)
-        t.start()
-    except Exception as e:
-        logger.error(f"[WEBHOOK] falha ao iniciar Flask: {e}")
-
-# Start immediately to avoid missing early callbacks in some runners
-try:
-    _start_flask_webhook()
-except Exception as e:
-    logger.error(f"[WEBHOOK] auto-start failed: {e}")
-
