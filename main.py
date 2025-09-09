@@ -1716,8 +1716,8 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                     pretty = _format_pix_copy_code(copia)
                     await context.bot.send_message(
                         chat_id=q.message.chat_id,
-                        text="📋 Copia e Cola PIX:\n" + pretty,
-                        parse_mode=None
+                        text="📋 Copia e Cola PIX:\n```\n" + str(copia) + "\n```",
+                        parse_mode="MarkdownV2"
                     )
                 except Exception as e:
                     logger.error(f"send copy-paste failed: {e}")
