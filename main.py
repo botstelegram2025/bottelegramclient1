@@ -6581,14 +6581,101 @@ def _get_telegram_bot_instance():
         return None
 
 
+
 @app.route("/webhook/mercadopago", methods=["POST", "GET"])
 def mercadopago_webhook():
+    """Webhook do Mercado Pago. Aceita payload JSON e também querystring (id/topic, data.id/type)."""
     try:
-        if request.method == "GET":
-            return "OK", 200
-
+        # 1) Extrai payment_id de forma resiliente
+        payment_id = None
         payload = request.get_json(silent=True) or {}
-        result = payment_service.process_webhook(payload)
+
+        # a) JSON padrão: {"type":"payment","data":{"id":"123"}}
+        if isinstance(payload, dict):
+            if payload.get("type") in {"payment", "payments"} and isinstance(payload.get("data"), dict):
+                payment_id = payload["data"].get("id") or payment_id
+            # b) Recurso: {"resource": ".../payments/123"}
+            res = payload.get("resource")
+            if not payment_id and isinstance(res, str) and "/payments/" in res:
+                import re as _re
+                m = _re.search(r"/payments/(\d+)", res)
+                if m:
+                    payment_id = m.group(1)
+
+        # c) Querystring: ?id=...&topic=payment
+        if not payment_id:
+            payment_id = request.args.get("id") or payment_id
+
+        # d) Querystring alternativa: ?data.id=...&type=payment
+        if not payment_id:
+            payment_id = request.args.get("data.id") or payment_id
+
+        # e) Fallback por formulário
+        if not payment_id and request.form:
+            payment_id = request.form.get("id") or request.form.get("data.id")
+
+        if not payment_id:
+            logger.error(f"[WEBHOOK] sem payment_id - payload={payload} args={dict(request.args)} form={dict(request.form)}")
+            return jsonify({"ok": False, "error": "missing_payment_id"}), 200
+
+        logger.info(f"[WEBHOOK] recebido payment_id={payment_id}")
+
+        # 2) Confirma status no MP e extrai telegram_id
+        status = payment_service.check_payment_status(str(payment_id))
+        if not status.get("success"):
+            logger.error(f"[WEBHOOK] status lookup falhou: {status}")
+            return jsonify({"ok": False, "error": "status_lookup_failed"}), 200
+
+        paid = bool(status.get("paid")) or (status.get("status") == "approved")
+        payment_raw = status.get("raw") or {}
+        tg_id = status.get("telegram_id")
+
+        if not tg_id:
+            tg_id = _extract_tg_id_from_payment(payment_raw)
+
+        if paid and tg_id:
+            try:
+                with db_service.get_session() as session:
+                    db_user = session.query(User).filter_by(telegram_id=str(tg_id)).first()
+                    if not db_user:
+                        logger.error(f"[WEBHOOK] usuário não encontrado para telegram_id={tg_id}")
+                        return jsonify({"ok": True, "warn": "user_not_found"}), 200
+
+                    expires = _activate_user_subscription(session, db_user, str(payment_id))
+
+                # Notifica via Telegram HTTP
+                try:
+                    from config import Config as _Cfg
+                    token = getattr(_Cfg, "TELEGRAM_BOT_TOKEN", None) or getattr(_Cfg, "BOT_TOKEN", None)
+                    if token:
+                        import requests
+                        url = f"https://api.telegram.org/bot{token}/sendMessage"
+                        data = {
+                            "chat_id": int(tg_id),
+                            "text": "✅ Pagamento confirmado automaticamente!\n" +
+                                    f"📅 Assinatura válida até: {expires.strftime('%d/%m/%Y')}",
+                            "parse_mode": "HTML",
+                            "reply_markup": '{"inline_keyboard":[[{"text":"🏠 Menu Principal","callback_data":"main_menu"}]]}',
+                        }
+                        r = requests.post(url, json=data, timeout=10)
+                        logger.info(f"[WEBHOOK] telegram notify status={r.status_code}")
+                    else:
+                        logger.error("[WEBHOOK] TELEGRAM_BOT_TOKEN ausente; notificação não enviada.")
+                except Exception as e:
+                    logger.error(f"[WEBHOOK] erro ao notificar por HTTP: {e}")
+
+                return jsonify({"ok": True, "status": "approved"}), 200
+            except Exception as e:
+                logger.error(f"[WEBHOOK] erro ao ativar assinatura: {e}")
+                return jsonify({"ok": False, "error": "db_error"}), 200
+
+        logger.info(f"[WEBHOOK] não aprovado ainda: id={payment_id} status={status.get('status')}")
+        return jsonify({"ok": True, "status": status.get("status")}), 200
+
+    except Exception as e:
+        logger.error(f"[WEBHOOK] erro inesperado: {e}")
+        return jsonify({"ok": False, "error": "unexpected"}), 200
+
 
         if not result.get("success"):
             logger.error(f"[WEBHOOK] payload inválido/sem payment_id: {payload}")
