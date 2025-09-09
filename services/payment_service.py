@@ -1,146 +1,258 @@
-import mercadopago
-import logging
+# services/payment_service.py
+"""
+Payment Service - Mercado Pago (PIX)
+------------------------------------
+Implementação robusta e autocontida para criação de cobranças PIX no Mercado Pago,
+com normalização de resposta e verificação de status.
+
+✅ Métodos expostos:
+- create_pix_payment(user_id, amount, description, **kwargs) -> dict
+- create_pix_subscription(user_id, amount, description, **kwargs) -> dict  (alias p/ PIX avulso)
+- create_payment(user_id, amount, description, method="pix", **kwargs) -> dict
+- check_payment_status(payment_id) -> dict
+
+🔧 Variáveis de ambiente esperadas:
+- MP_ACCESS_TOKEN           (obrigatória)
+- MP_INTEGRATOR_ID          (opcional, só para tracking/testes)
+- MP_API_BASE               (opcional; padrão "https://api.mercadopago.com")
+
+Observações:
+- Para PIX, o endpoint é: POST /v1/payments com {"payment_method_id": "pix"}
+- O Mercado Pago retorna os dados úteis dentro de point_of_interaction.transaction_data
+  (qr_code, qr_code_base64, ticket_url, etc.).
+- Esta implementação **normaliza** a saída para o formato esperado pelos callbacks do bot:
+    {
+        "success": True/False,
+        "payment_id": "...",
+        "qr_code_base64": "...",   # QR como base64 (quando vier)
+        "copy_paste": "...",       # Código copia-e-cola (quando vier)
+        "payment_link": "...",     # Link opcional de pagamento
+        "raw": {...}               # Payload bruto retornado pelo MP (p/ debug)
+    }
+- Inclui logging defensivo, com mascaramento do token.
+"""
+
+from __future__ import annotations
+
+import os
 import time
-from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
-from config import Config
+import logging
+from typing import Any, Dict, Optional
+
+import requests
 
 logger = logging.getLogger(__name__)
 
+
+def _mask_token(token: str) -> str:
+    if not token:
+        return ""
+    if len(token) <= 8:
+        return "*" * len(token)
+    return token[:4] + "*" * (len(token) - 8) + token[-4:]
+
+
+class MercadoPagoClient:
+    def __init__(self, access_token: Optional[str] = None, base_url: Optional[str] = None, integrator_id: Optional[str] = None):
+        self.access_token = access_token or os.getenv("MP_ACCESS_TOKEN", "").strip()
+        self.base_url = (base_url or os.getenv("MP_API_BASE", "https://api.mercadopago.com")).rstrip("/")
+        self.integrator_id = integrator_id or os.getenv("MP_INTEGRATOR_ID", "").strip()
+
+        if not self.access_token:
+            logger.warning("⚠️ MP_ACCESS_TOKEN não configurado. Pagamentos PIX não funcionarão.")
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+        if self.integrator_id:
+            headers["x-integrator-id"] = self.integrator_id
+        return headers
+
+    def post(self, path: str, json_data: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        try:
+            logger.info(f"MP POST {path} | base={self.base_url} | token={_mask_token(self.access_token)}")
+            resp = requests.post(url, headers=self._headers(), json=json_data, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as e:
+            # Tentar extrair corpo de erro legível
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"error": str(resp.text)}
+            logger.error(f"HTTPError MP POST {path}: {e} | data={data}")
+            return {"success": False, "error": str(e), "raw": data}
+        except Exception as e:
+            logger.error(f"Erro MP POST {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get(self, path: str, timeout: int = 15) -> Dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        try:
+            logger.info(f"MP GET {path} | base={self.base_url} | token={_mask_token(self.access_token)}")
+            resp = requests.get(url, headers=self._headers(), timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as e:
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"error": str(resp.text)}
+            logger.error(f"HTTPError MP GET {path}: {e} | data={data}")
+            return {"success": False, "error": str(e), "raw": data}
+        except Exception as e:
+            logger.error(f"Erro MP GET {path}: {e}")
+            return {"success": False, "error": str(e)}
+
+
+def _get_nested(d: Dict[str, Any], path: str, default: Any = None) -> Any:
+    cur = d
+    for p in path.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
+
+
+def _normalize_pix_response(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extrai e normaliza as informações de PIX do payload do Mercado Pago.
+    """
+    tx = _get_nested(raw, "point_of_interaction.transaction_data", {}) or {}
+
+    qr_b64 = (
+        raw.get("qr_code_base64")
+        or raw.get("qrCodeBase64")
+        or tx.get("qr_code_base64")
+        or tx.get("qr_code_base64_image")
+        or _get_nested(raw, "transaction_data.qr_code_base64")
+    )
+
+    copy_paste = (
+        raw.get("copy_paste")
+        or raw.get("pix_code")
+        or raw.get("copia_cola")
+        or raw.get("copyAndPaste")
+        or tx.get("qr_code")
+        or _get_nested(raw, "transaction_data.qr_code")
+    )
+
+    payment_link = (
+        raw.get("payment_link")
+        or raw.get("checkout_url")
+        or _get_nested(raw, "point_of_interaction.transaction_data.ticket_url")
+        or _get_nested(raw, "point_of_interaction.transaction_data.url")
+        or raw.get("init_point")
+    )
+
+    payment_id = raw.get("id") or raw.get("payment_id") or raw.get("preference_id") or _get_nested(raw, "transaction_data.external_reference")
+
+    success = bool(qr_b64 or copy_paste or payment_link)
+
+    normalized = {
+        "success": success,
+        "payment_id": payment_id,
+        "qr_code_base64": qr_b64,
+        "copy_paste": copy_paste,
+        "payment_link": payment_link,
+        "raw": raw,
+    }
+    return normalized
+
+
 class PaymentService:
     def __init__(self):
-        self.sdk = mercadopago.SDK(Config.MERCADO_PAGO_ACCESS_TOKEN)
+        self.client = MercadoPagoClient()
 
-    # ---------------- Public API ----------------
+    # ----------------- Public API -----------------
 
-    def create_subscription_payment(self, user_telegram_id: str, amount: Optional[float] = None, method: str = "pix") -> Dict[str, Any]:
+    def create_pix_payment(self, user_id: Any, amount: float, description: str, **kwargs) -> Dict[str, Any]:
         """
-        Cria pagamento PIX para assinatura (alias do método PIX avulso).
+        Cria uma cobrança PIX avulsa.
+        Docs: https://www.mercadopago.com.br/developers/pt/reference/payments/_payments/post
         """
-        try:
-            if amount is None:
-                amount = getattr(Config, "MONTHLY_SUBSCRIPTION_PRICE", 20.0) or 20.0
-            return self._create_pix_payment(user_telegram_id, float(amount))
-        except Exception as e:
-            logger.error(f"[MP] Error creating subscription payment: {e}")
-            return {"success": False, "error": "Payment service error", "details": str(e)}
+        if not self.client.access_token:
+            return {"success": False, "error": "MP_ACCESS_TOKEN ausente"}
 
-    def check_payment_status(self, payment_id: str) -> Dict[str, Any]:
-        """
-        Verifica status do pagamento no Mercado Pago
-        """
-        try:
-            resp = self.sdk.payment().get(payment_id)
-            payment = resp.get("response", {}) or {}
-            if resp.get("status") == 200:
-                paid = payment.get("status") == "approved"
-                return {
-                    "success": True,
-                    "payment_id": payment.get("id"),
-                    "status": payment.get("status"),
-                    "status_detail": payment.get("status_detail"),
-                    "paid": paid,
-                    "amount": payment.get("transaction_amount"),
-                    "date_approved": payment.get("date_approved"),
-                    "raw": payment,
-                }
-            else:
-                logger.error(f"[MP] Failed to get payment status: {resp}")
-                return {"success": False, "error": "Payment status check failed", "details": resp}
-        except Exception as e:
-            logger.error(f"[MP] Error checking payment status: {e}")
-            return {"success": False, "error": "Payment service error", "details": str(e)}
+        external_reference = kwargs.get("external_reference") or f"user:{user_id}|ts:{int(time.time())}"
 
-    def process_webhook(self, webhook_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Processa notificação (webhook) do Mercado Pago
-        """
-        try:
-            if webhook_data.get("type") == "payment":
-                payment_id = webhook_data.get("data", {}).get("id")
-                if payment_id:
-                    status = self.check_payment_status(str(payment_id))
-                    if status.get("success"):
-                        return {
-                            "success": True,
-                            "payment_id": payment_id,
-                            "status": status["status"],
-                            "action_required": status.get("paid", False),
-                        }
-            return {"success": False, "error": "Invalid webhook data", "details": webhook_data}
-        except Exception as e:
-            logger.error(f"[MP] Error processing webhook: {e}")
-            return {"success": False, "error": "Webhook processing error", "details": str(e)}
+        payer = kwargs.get("payer") or {}
+        # Se quiser garantir email fake padrão para testes:
+        if "email" not in payer:
+            payer["email"] = f"user{user_id}@example.com"
 
-    # ---------------- Internal ----------------
-
-    def _create_pix_payment(self, user_telegram_id: str, amount: float) -> Dict[str, Any]:
-        """
-        Cria cobrança PIX no Mercado Pago e normaliza a resposta.
-        Faz um pequeno retry de 2x no GET /payments/{id} caso o QR demore para aparecer.
-        """
-        try:
-            payment_data = {
-                "transaction_amount": round(float(amount), 2),
-                "description": f"Assinatura Mensal - Bot Telegram - {user_telegram_id}",
-                "payment_method_id": "pix",
-                "payer": {
-                    "email": f"user_{user_telegram_id}@telegram.bot",
-                    "identification": {"type": "CPF", "number": "00000000000"},
-                },
-                "notification_url": f"{getattr(Config, 'WEBHOOK_BASE_URL', '').rstrip('/')}/webhook/mercadopago" if getattr(Config, 'WEBHOOK_BASE_URL', None) else None,
-                "external_reference": f"telegram_bot_{user_telegram_id}_{int(datetime.now().timestamp())}",
-                "date_of_expiration": (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
-            }
-            # remove keys None
-            payment_data = {k: v for k, v in payment_data.items() if v is not None}
-
-            resp = self.sdk.payment().create(payment_data)
-            payment = resp.get("response", {}) or {}
-
-            logger.info(f"[MP] create payment status={resp.get('status')} id={payment.get('id')} keys={list(payment.keys())}")
-
-            # às vezes o campo transaction_data demora a aparecer; fazer 2 tentativas de GET
-            if resp.get("status") == 201:
-                payment_id = payment.get("id")
-                norm = self._normalize_pix(payment)
-                if not (norm.get("qr_code_base64") or norm.get("copy_paste") or norm.get("payment_link")) and payment_id:
-                    for i in range(2):
-                        time.sleep(1.0)
-                        check = self.sdk.payment().get(str(payment_id))
-                        payment = check.get("response", {}) or {}
-                        logger.info(f"[MP] retry GET {i+1} status={check.get('status')} id={payment.get('id')}")
-                        norm = self._normalize_pix(payment)
-                        if norm.get("qr_code_base64") or norm.get("copy_paste") or norm.get("payment_link"):
-                            break
-                return norm
-            else:
-                logger.error(f"[MP] PIX create failed: {resp}")
-                return {"success": False, "error": "Payment creation failed", "details": resp}
-        except Exception as e:
-            logger.error(f"[MP] Error creating PIX payment: {e}")
-            return {"success": False, "error": "Payment service error", "details": str(e)}
-
-    def _normalize_pix(self, payment: Dict[str, Any]) -> Dict[str, Any]:
-        tx = ((payment or {}).get("point_of_interaction") or {}).get("transaction_data", {}) or {}
-        qr_b64 = tx.get("qr_code_base64") or tx.get("qr_code_base64_image")
-        copy_paste = tx.get("qr_code")
-        link = tx.get("ticket_url") or tx.get("url")
-
-        norm = {
-            "success": bool(qr_b64 or copy_paste or link),
-            "payment_id": payment.get("id"),
-            "status": payment.get("status"),
-            "qr_code_base64": qr_b64,
-            "copy_paste": copy_paste,
-            "qr_code": copy_paste,        # alias útil para callbacks antigos
-            "payment_link": link,
-            "amount": payment.get("transaction_amount"),
-            "expires_at": payment.get("date_of_expiration"),
-            "raw": payment,
+        payload = {
+            "transaction_amount": round(float(amount), 2),
+            "description": description or "Pagamento PIX",
+            "payment_method_id": "pix",
+            "payer": payer,
+            "external_reference": external_reference,
         }
-        logger.info(f"[MP] normalized: success={norm['success']} has_qr_b64={bool(qr_b64)} has_copy={bool(copy_paste)} has_link={bool(link)}")
+
+        # opcional: notification_url (webhook)
+        notif_url = kwargs.get("notification_url") or os.getenv("MP_NOTIFICATION_URL")
+        if notif_url:
+            payload["notification_url"] = notif_url
+
+        raw = self.client.post("/v1/payments", json_data=payload)
+        # Se a chamada já retornou um dicionário com "success": False, preserve a mensagem
+        if isinstance(raw, dict) and raw.get("success") is False and "raw" in raw:
+            return raw
+
+        norm = _normalize_pix_response(raw if isinstance(raw, dict) else {})
+        # Adiciona status bruto (helpful)
+        norm["status"] = raw.get("status") if isinstance(raw, dict) else None
         return norm
 
-# Instância global
+    def create_payment(self, user_id: Any, amount: float, description: str, method: str = "pix", **kwargs) -> Dict[str, Any]:
+        """
+        Wrapper genérico. Por enquanto, se method == 'pix', delega para create_pix_payment.
+        (No futuro, pode-se adicionar cartão, boleto, etc.)
+        """
+        method = (method or "pix").lower()
+        if method == "pix":
+            return self.create_pix_payment(user_id=user_id, amount=amount, description=description, **kwargs)
+        return {"success": False, "error": f"Método não suportado: {method}"}
+
+    def create_pix_subscription(self, user_id: Any, amount: float, description: str, **kwargs) -> Dict[str, Any]:
+        """
+        Alias de PIX avulso. Mercado Pago não suporta assinatura recorrente em PIX pela API
+        da mesma forma que cartão (preapproval). Portanto, criamos uma cobrança PIX avulsa.
+        """
+        return self.create_pix_payment(user_id=user_id, amount=amount, description=description, **kwargs)
+
+    def check_payment_status(self, payment_id: Any) -> Dict[str, Any]:
+        """
+        Verifica status de um pagamento.
+        Para PIX, quando confirmado, o status tende a ser 'approved'.
+        Docs: https://www.mercadopago.com.br/developers/pt/reference/payments/_payments_id/get
+        """
+        if not self.client.access_token:
+            return {"success": False, "error": "MP_ACCESS_TOKEN ausente"}
+
+        pid = str(payment_id).strip()
+        if not pid:
+            return {"success": False, "error": "payment_id inválido"}
+
+        raw = self.client.get(f"/v1/payments/{pid}")
+        if isinstance(raw, dict) and raw.get("success") is False and "raw" in raw:
+            return raw
+
+        status = raw.get("status") if isinstance(raw, dict) else None
+        status_detail = raw.get("status_detail") if isinstance(raw, dict) else None
+        paid = (status == "approved")
+
+        return {
+            "success": True,
+            "paid": paid,
+            "status": status,
+            "status_detail": status_detail,
+            "raw": raw,
+        }
+
+
+# Instância única para ser importada no bot
 payment_service = PaymentService()
