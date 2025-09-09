@@ -76,6 +76,38 @@ from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
 
+
+
+def _extract_payment_id(result: dict) -> str:
+    """Tenta extrair o payment_id de vários campos e do ticket_url."""
+    if not isinstance(result, dict):
+        return ""
+    # diretos
+    for k in ("payment_id", "id"):
+        v = result.get(k)
+        if v:
+            return str(v)
+    # aninhados comuns
+    def g(d, path, default=None):
+        cur = d
+        for p in path.split("."):
+            if not isinstance(cur, dict) or p not in cur:
+                return default
+            cur = cur[p]
+        return cur
+    rid = g(result, "response.id")
+    if rid:
+        return str(rid)
+    tx = g(result, "point_of_interaction.transaction_data", {}) or {}
+    # de ticket_url: .../payments/<id>/ticket...
+    url = tx.get("ticket_url") or tx.get("url") or result.get("payment_link") or result.get("init_point")
+    if isinstance(url, str):
+        m = re.search(r"/payments/(\d+)", url)
+        if m:
+            return m.group(1)
+    return ""
+
+
 # ---- SAFE GUARD: ensure helper exists even if removed by merge ----
 if "_format_pix_copy_code" not in globals():
     def _format_pix_copy_code(code: str, chunk: int = 36) -> str:
@@ -6518,7 +6550,7 @@ async def _poll_payment_job(context: ContextTypes.DEFAULT_TYPE):
     user_id = data.get("user_id")
     chat_id = data.get("chat_id")
     tries = int(data.get("tries") or 0)
-    max_tries = int(data.get("max_tries") or 120)  # ~40 min se interval=20s
+    max_tries = int(data.get("max_tries") or 180)  # ~15 min se interval=5s
 
     try:
         # 1) Checa status
