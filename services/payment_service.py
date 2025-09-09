@@ -1,3 +1,4 @@
+
 import mercadopago
 import logging
 import time
@@ -16,6 +17,7 @@ class PaymentService:
     def create_subscription_payment(self, user_telegram_id: str, amount: Optional[float] = None, method: str = "pix") -> Dict[str, Any]:
         """
         Cria pagamento PIX para assinatura (alias do método PIX avulso).
+        Inclui metadata e external_reference com o telegram_id para facilitar o processamento do webhook.
         """
         try:
             if amount is None:
@@ -27,13 +29,15 @@ class PaymentService:
 
     def check_payment_status(self, payment_id: str) -> Dict[str, Any]:
         """
-        Verifica status do pagamento no Mercado Pago
+        Verifica status do pagamento no Mercado Pago.
+        Retorna também o telegram_id (extraído do external_reference/metadata), quando possível.
         """
         try:
             resp = self.sdk.payment().get(payment_id)
             payment = resp.get("response", {}) or {}
             if resp.get("status") == 200:
                 paid = payment.get("status") == "approved"
+                tg_id = self._extract_telegram_id(payment)
                 return {
                     "success": True,
                     "payment_id": payment.get("id"),
@@ -42,6 +46,7 @@ class PaymentService:
                     "paid": paid,
                     "amount": payment.get("transaction_amount"),
                     "date_approved": payment.get("date_approved"),
+                    "telegram_id": tg_id,
                     "raw": payment,
                 }
             else:
@@ -53,21 +58,30 @@ class PaymentService:
 
     def process_webhook(self, webhook_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Processa notificação (webhook) do Mercado Pago
+        Processa notificação (webhook) do Mercado Pago.
+        Suporta múltiplos formatos de payload e retorna dados suficientes
+        para que a camada superior ative a assinatura e notifique o usuário.
         """
         try:
-            if webhook_data.get("type") == "payment":
-                payment_id = webhook_data.get("data", {}).get("id")
-                if payment_id:
-                    status = self.check_payment_status(str(payment_id))
-                    if status.get("success"):
-                        return {
-                            "success": True,
-                            "payment_id": payment_id,
-                            "status": status["status"],
-                            "action_required": status.get("paid", False),
-                        }
-            return {"success": False, "error": "Invalid webhook data", "details": webhook_data}
+            payment_id = self._extract_payment_id_from_webhook(webhook_data)
+            if not payment_id:
+                return {"success": False, "error": "Invalid webhook data (no payment_id)", "details": webhook_data}
+
+            status = self.check_payment_status(str(payment_id))
+            if not status.get("success"):
+                return {"success": False, "error": "Status lookup failed", "details": status}
+
+            result = {
+                "success": True,
+                "payment_id": payment_id,
+                "status": status.get("status"),
+                "paid": status.get("paid", False),
+                "telegram_id": status.get("telegram_id") or self._extract_telegram_id(status.get("raw") or {}),
+                "raw": status.get("raw"),
+                "action_required": status.get("paid", False),  # alias compatível
+            }
+            return result
+
         except Exception as e:
             logger.error(f"[MP] Error processing webhook: {e}")
             return {"success": False, "error": "Webhook processing error", "details": str(e)}
@@ -80,6 +94,11 @@ class PaymentService:
         Faz um pequeno retry de 2x no GET /payments/{id} caso o QR demore para aparecer.
         """
         try:
+            webhook_base = getattr(Config, "WEBHOOK_BASE_URL", None)
+            if not webhook_base:
+                logger.warning("[MP] WEBHOOK_BASE_URL não configurado em Config; Mercado Pago NÃO enviará notificações.")
+            notification_url = f"{str(webhook_base).rstrip('/')}/webhook/mercadopago" if webhook_base else None
+
             payment_data = {
                 "transaction_amount": round(float(amount), 2),
                 "description": f"Assinatura Mensal - Bot Telegram - {user_telegram_id}",
@@ -88,9 +107,13 @@ class PaymentService:
                     "email": f"user_{user_telegram_id}@telegram.bot",
                     "identification": {"type": "CPF", "number": "00000000000"},
                 },
-                "notification_url": f"{getattr(Config, 'WEBHOOK_BASE_URL', '').rstrip('/')}/webhook/mercadopago" if getattr(Config, 'WEBHOOK_BASE_URL', None) else None,
+                "notification_url": notification_url,
                 "external_reference": f"telegram_bot_{user_telegram_id}_{int(datetime.now().timestamp())}",
                 "date_of_expiration": (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+                "metadata": {
+                    "source": "telegram_bot",
+                    "telegram_id": str(user_telegram_id),
+                },
             }
             # remove keys None
             payment_data = {k: v for k, v in payment_data.items() if v is not None}
@@ -98,7 +121,7 @@ class PaymentService:
             resp = self.sdk.payment().create(payment_data)
             payment = resp.get("response", {}) or {}
 
-            logger.info(f"[MP] create payment status={resp.get('status')} id={payment.get('id')} keys={list(payment.keys())}")
+            logger.info(f"[MP] create payment status={resp.get('status')} id={payment.get('id')} keys={list(payment.keys())} notification_url={notification_url}")
 
             # às vezes o campo transaction_data demora a aparecer; fazer 2 tentativas de GET
             if resp.get("status") == 201:
@@ -137,10 +160,76 @@ class PaymentService:
             "payment_link": link,
             "amount": payment.get("transaction_amount"),
             "expires_at": payment.get("date_of_expiration"),
+            "external_reference": payment.get("external_reference"),
+            "telegram_id": self._extract_telegram_id(payment),
             "raw": payment,
         }
         logger.info(f"[MP] normalized: success={norm['success']} has_qr_b64={bool(qr_b64)} has_copy={bool(copy_paste)} has_link={bool(link)}")
         return norm
+
+    # ---------------- Helpers ----------------
+
+    def _extract_payment_id_from_webhook(self, payload: Dict[str, Any]) -> Optional[str]:
+        """
+        Aceita formatos comuns do MP:
+        - {'type': 'payment', 'data': {'id': '123'}}
+        - {'resource': '.../payments/123'}
+        - {'data_id': '123'} ou {'id': '123'} em algumas integrações
+        - querystrings não são suportadas aqui (devem ser tratadas na rota web)
+        """
+        try:
+            if not isinstance(payload, dict):
+                return None
+            # 1) Oficial
+            if payload.get("type") in {"payment", "payments"} and isinstance(payload.get("data"), dict):
+                pid = payload["data"].get("id")
+                if pid:
+                    return str(pid)
+            # 2) Recurso
+            resource = payload.get("resource")
+            if isinstance(resource, str) and "/payments/" in resource:
+                import re as _re
+                m = _re.search(r"/payments/(\d+)", resource)
+                if m:
+                    return m.group(1)
+            # 3) Fallbacks
+            for k in ("data_id", "id", "payment_id"):
+                v = payload.get(k)
+                if v:
+                    return str(v)
+            return None
+        except Exception:
+            return None
+
+    def _extract_telegram_id(self, payment: Dict[str, Any]) -> Optional[str]:
+        """
+        Extrai telegram_id de external_reference, metadata ou description.
+        """
+        try:
+            if not isinstance(payment, dict):
+                return None
+            # external_reference padrão: telegram_bot_<telegram_id>_<timestamp>
+            ext = payment.get("external_reference") or payment.get("external_reference_id") or ""
+            if isinstance(ext, str) and "telegram_bot_" in ext:
+                import re as _re
+                m = _re.search(r"telegram_bot_(\d+)_", ext)
+                if m:
+                    return m.group(1)
+            # metadata
+            md = payment.get("metadata") or {}
+            for k in ("telegram_id", "telegram_user_id", "tg_id"):
+                if k in md and md[k]:
+                    return str(md[k])
+            # description (fallback)
+            desc = payment.get("description") or ""
+            if isinstance(desc, str):
+                import re as _re
+                m2 = _re.search(r"telegram[_\s-]?id[:\s-]?(\d+)", desc, flags=_re.I)
+                if m2:
+                    return m2.group(1)
+            return None
+        except Exception:
+            return None
 
 # Instância global
 payment_service = PaymentService()
