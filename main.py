@@ -75,6 +75,20 @@ from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
+
+# ---- SAFE GUARD: ensure helper exists even if file is partially merged elsewhere ----
+if "_format_pix_copy_code" not in globals():
+    def _format_pix_copy_code(code: str, chunk: int = 36) -> str:
+        try:
+            code = str(code).strip()
+            if not code:
+                return ""
+            return "\n".join(code[i:i+chunk] for i in range(0, len(code), chunk))
+        except Exception:
+            return str(code)
+# -------------------------------------------------------------------------------------
+
+
 # Conversation states
 WAITING_FOR_PHONE = 1
 WAITING_CLIENT_NAME = 2
