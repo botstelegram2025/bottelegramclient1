@@ -6527,6 +6527,11 @@ if __name__ == '__main__':
 
 # ===== Mercado Pago Webhook (Flask) =====
 app = Flask(__name__)
+# Tornar compatível com / e sem /
+try:
+    app.url_map.strict_slashes = False
+except Exception:
+    pass
 
 def _extract_tg_id_from_payment(payment: dict) -> str:
     """Extrai o telegram_id do external_reference/description/metadata."""
@@ -6620,6 +6625,7 @@ def _get_telegram_bot_instance():
 
 
 @app.route("/webhook/mercadopago", methods=["POST", "GET"])
+@app.route("/webhook/mercadopago/", methods=["POST", "GET"])
 def mercadopago_webhook():
     """Webhook do Mercado Pago. Aceita payload JSON e também querystring (id/topic, data.id/type)."""
     try:
@@ -6760,6 +6766,12 @@ def mercadopago_webhook():
         return jsonify({"ok": False, "error": "unexpected"}), 200
 
 # ===== Inicialização do servidor Flask em thread separada =====
+
+# Pequena rota de saúde para testar no navegador/MP
+@app.route("/health", methods=["GET"])  
+def health():
+    from datetime import datetime
+    return jsonify({"ok": True, "status": "healthy", "ts": datetime.now().isoformat()}), 200
 
 # ===== Start Flask on import (single-run guard) =====
 __FLASK_WEBHOOK_STARTED = False
