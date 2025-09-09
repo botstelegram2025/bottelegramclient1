@@ -37,13 +37,16 @@ RUN if [[ -f package-lock.json ]]; then \
     fi
 
 # --- Python venv para evitar PEP 668 (externally-managed-environment) ---
-RUN python3 -m venv /opt/venv
+# --- Python venv para evitar PEP 668 (externally-managed) ---
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/python -m ensurepip --upgrade || true \
+ && /opt/venv/bin/python -m pip install --upgrade pip setuptools wheel
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # --- Python deps ---
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # --- Código da aplicação ---
 COPY . .
