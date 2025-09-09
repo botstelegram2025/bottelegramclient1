@@ -1,7 +1,7 @@
 # Multi-service (Node + Python) image for Railway (Web service)
 FROM node:20-slim
 
-# Use bash for all RUN steps (we rely on [[ ... ]] and { ...; } blocks)
+# Use bash for RUN steps
 SHELL ["/bin/bash", "-lc"]
 
 # --- System deps ---
@@ -10,12 +10,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make \
     libpq-dev \
     curl ca-certificates bash \
+    git openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # --- Node deps (copy package.json and optionally the lockfile) ---
 COPY package.json package-lock.json* ./
+
+# Avoid git prompts; prefer https for github
+RUN git config --global url."https://github.com/".insteadOf git@github.com: || true \
+ && git config --global --add safe.directory /app || true \
+ && export GIT_ASKPASS=/bin/true
 
 # Prefer ci when lock is valid; fall back to install if out-of-sync
 RUN if [[ -f package-lock.json ]]; then \
