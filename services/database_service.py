@@ -101,19 +101,19 @@ class DatabaseService:
         default_templates = [
             {
                 'name': '📅 Lembrete 2 dias antes',
-                'template_type': 'reminder_2days',
+                'template_type': 'reminder_2_days',
                 'subject': 'Lembrete: Vencimento em 2 dias',
                 'content': '📅 LEMBRETE: 2 DIAS PARA VENCER\n\nOlá {nome}! \n\n📺 Seu plano "{plano}" vencerá em 2 dias.\n📅 Data de vencimento: {vencimento}\n💰 Valor: R$ {valor}\n\nPara renovar, entre em contato conosco.\n\nObrigado! 😊'
             },
             {
                 'name': '⏰ Lembrete 1 dia antes',
-                'template_type': 'reminder_1day',
+                'template_type': 'reminder_1_day',
                 'subject': 'Lembrete: Vencimento amanhã',
                 'content': '⏰ ÚLTIMO AVISO: VENCE AMANHÃ!\n\nOlá {nome}!\n\n📺 Seu plano "{plano}" vence AMANHÃ ({vencimento}).\n💰 Valor: R$ {valor}\n\nNão esqueça de renovar para continuar aproveitando nossos serviços!\n\nRenove agora! 🚀'
             },
             {
                 'name': '🚨 Vencimento hoje',
-                'template_type': 'reminder_due',
+                'template_type': 'reminder_due_date',
                 'subject': 'Vencimento hoje',
                 'content': '🚨 ATENÇÃO: VENCE HOJE!\n\nOlá {nome}!\n\n📺 Seu plano "{plano}" vence HOJE ({vencimento}).\n💰 Valor: R$ {valor}\n\nRenove agora para não perder o acesso aos nossos serviços.\n\nContate-nos para renovar! 💬'
             },
@@ -156,19 +156,19 @@ class DatabaseService:
         default_templates = [
             {
                 'name': '📅 Lembrete 2 dias antes',
-                'template_type': 'reminder_2days',
+                'template_type': 'reminder_2_days',
                 'subject': 'Lembrete: Vencimento em 2 dias',
                 'content': '📅 LEMBRETE: 2 DIAS PARA VENCER\n\nOlá {nome}! \n\n📺 Seu plano "{plano}" vencerá em 2 dias.\n📅 Data de vencimento: {vencimento}\n💰 Valor: R$ {valor}\n\nPara renovar, entre em contato conosco.\n\nObrigado! 😊'
             },
             {
                 'name': '⏰ Lembrete 1 dia antes',
-                'template_type': 'reminder_1day',
+                'template_type': 'reminder_1_day',
                 'subject': 'Lembrete: Vencimento amanhã',
                 'content': '⏰ ÚLTIMO AVISO: VENCE AMANHÃ!\n\nOlá {nome}!\n\n📺 Seu plano "{plano}" vence AMANHÃ ({vencimento}).\n💰 Valor: R$ {valor}\n\nNão esqueça de renovar para continuar aproveitando nossos serviços!\n\nRenove agora! 🚀'
             },
             {
                 'name': '🚨 Vencimento hoje',
-                'template_type': 'reminder_due',
+                'template_type': 'reminder_due_date',
                 'subject': 'Vencimento hoje',
                 'content': '🚨 ATENÇÃO: VENCE HOJE!\n\nOlá {nome}!\n\n📺 Seu plano "{plano}" vence HOJE ({vencimento}).\n💰 Valor: R$ {valor}\n\nRenove agora para não perder o acesso aos nossos serviços.\n\nContate-nos para renovar! 💬'
             },
