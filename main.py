@@ -75,6 +75,20 @@ from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
+
+# ---- SAFE GUARD: ensure helper exists even if removed by merge ----
+if "_format_pix_copy_code" not in globals():
+    def _format_pix_copy_code(code: str, chunk: int = 36) -> str:
+        try:
+            s = str(code or "").strip()
+            if not s:
+                return ""
+            return "\n".join(s[i:i+chunk] for i in range(0, len(s), chunk))
+        except Exception:
+            return str(code)
+# ----------------------------------------------------------------------------
+
+
 # Conversation states
 WAITING_FOR_PHONE = 1
 WAITING_CLIENT_NAME = 2
@@ -1580,25 +1594,37 @@ async def subscription_info_callback(update: Update, context: ContextTypes.DEFAU
 # === PIX / Assinatura ===
 
 # === PIX / Assinatura — compatível com create_subscription_payment ===
+
 async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia pagamento via PIX e envia:
+       1) QR Code (foto)
+       2) Código copia-e-cola (mensagem separada, texto puro)
+       3) Instruções e link (texto puro)
+    """
     if not update.callback_query:
         return
 
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
     try:
-        from datetime import datetime
         with db_service.get_session() as session:
-            tg_user = query.from_user
+            tg_user = q.from_user
             db_user = session.query(User).filter_by(telegram_id=str(tg_user.id)).first()
             if not db_user:
-                await query.edit_message_text("❌ Usuário não encontrado. Use /start para se registrar.")
+                try:
+                    await q.edit_message_text("❌ Usuário não encontrado. Use /start para se registrar.")
+                except Exception:
+                    pass
                 return
 
             amount = getattr(Config, "MONTHLY_SUBSCRIPTION_PRICE", 20.00) or 20.00
             description = "Assinatura Mensal - Bot Gestor"
 
+            # Tentativas de criação do pagamento
             result = None
             try:
                 if hasattr(payment_service, "create_subscription_payment"):
@@ -1625,6 +1651,105 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
 
             raw = result or {}
 
+            # Extract normalized fields
+            def g(d, path, default=None):
+                cur = d
+                for part in path.split("."):
+                    if not isinstance(cur, dict) or part not in cur:
+                        return default
+                    cur = cur[part]
+                return cur
+
+            tx = g(raw, "point_of_interaction.transaction_data", {}) or {}
+
+            qr_b64 = (
+                raw.get("qr_code_base64")
+                or raw.get("qrCodeBase64")
+                or tx.get("qr_code_base64")
+                or tx.get("qr_code_base64_image")
+                or g(raw, "transaction_data.qr_code_base64")
+            )
+
+            copia = (
+                raw.get("copy_paste")
+                or raw.get("copia_cola")
+                or raw.get("pix_code")
+                or raw.get("qr_code")  # alias
+                or tx.get("qr_code")
+                or g(raw, "transaction_data.qr_code")
+            )
+
+            link = (
+                raw.get("payment_link")
+                or raw.get("checkout_url")
+                or tx.get("ticket_url")
+                or tx.get("url")
+                or raw.get("init_point")
+            )
+
+            # 0) Informe curto na mensagem original (não travar se falhar)
+            try:
+                await q.edit_message_text("✅ Enviamos abaixo as instruções e o QR Code/PIX.")
+            except Exception as e:
+                logger.error(f"edit original msg failed: {e}")
+
+            # 1) QR Code (se houver)
+            if qr_b64:
+                try:
+                    import base64, io
+                    if isinstance(qr_b64, str) and qr_b64.startswith("data:image"):
+                        qr_b64 = qr_b64.split(",")[1]
+                    qr_bytes = base64.b64decode(qr_b64) if isinstance(qr_b64, str) else qr_b64
+                    qr_photo = io.BytesIO(qr_bytes); qr_photo.name = "pix_qr_code.png"
+                    await context.bot.send_photo(
+                        chat_id=q.message.chat_id,
+                        photo=qr_photo,
+                        caption="📲 QR Code PIX\nEscaneie para pagar.",
+                        parse_mode=None
+                    )
+                except Exception as e:
+                    logger.error(f"send_photo failed: {e}")
+
+            # 2) Copia-e-cola (sempre texto puro)
+            if copia:
+                try:
+                    pretty = _format_pix_copy_code(copia)
+                    await context.bot.send_message(
+                        chat_id=q.message.chat_id,
+                        text="📋 Copia e Cola PIX:\n" + pretty,
+                        parse_mode=None
+                    )
+                except Exception as e:
+                    logger.error(f"send copy-paste failed: {e}")
+
+            # 3) Instruções + link (texto puro)
+            try:
+                parts = [
+                    "💳 Pagamento da Assinatura (PIX)",
+                    f"Valor: R$ {amount:.2f}",
+                    "",
+                    "Pague usando uma das opções:"
+                ]
+                if link:
+                    parts.append(f"Link de pagamento:\n{link}")
+                await context.bot.send_message(
+                    chat_id=q.message.chat_id,
+                    text="\n".join(parts),
+                    parse_mode=None,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]])
+                )
+            except Exception as e:
+                logger.error(f"send instructions failed: {e}")
+
+            return
+
+    except Exception as e:
+        logger.error(f"subscribe_now_callback fatal error: {e}")
+        try:
+            await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
+        except Exception:
+            pass
+
             def get_nested(d, path, default=None):
                 cur = d
                 for p in path.split("."):
@@ -1633,8 +1758,10 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                     cur = cur[p]
                 return cur
 
+            # Mercado Pago clássico
             mp_tx = get_nested(raw, "point_of_interaction.transaction_data", {}) or {}
 
+            # QR base64 (imagem)
             qr_b64 = (
                 raw.get("qr_code_base64")
                 or raw.get("qrCodeBase64")
@@ -1643,15 +1770,17 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                 or get_nested(raw, "transaction_data.qr_code_base64")
             )
 
+            # Código copia-e-cola (alguns serviços chamam de qr_code)
             copia_cola = (
                 raw.get("copy_paste")
                 or raw.get("copia_cola")
                 or raw.get("pix_code")
                 or mp_tx.get("qr_code")
-                or raw.get("qr_code")
+                or raw.get("qr_code")  # <-- importante p/ versões antigas
                 or get_nested(raw, "transaction_data.qr_code")
             )
 
+            # Link opcional
             pay_link = (
                 raw.get("payment_link")
                 or raw.get("checkout_url")
@@ -1660,10 +1789,41 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                 or raw.get("init_point")
             )
 
+            payment_id = (
+                raw.get("payment_id")
+                or raw.get("id")
+                or raw.get("preference_id")
+                or get_nested(raw, "transaction_data.external_reference")
+            )
+
+            # Heurística de sucesso: se veio QUALQUER um dos 3, já consideramos OK
             success = bool(qr_b64 or copia_cola or pay_link)
 
+            # Loga chaves para diagnóstico (sem expor valores)
+            try:
+                if isinstance(raw, dict):
+                    logger.info(f"[PIX] keys={list(raw.keys())}")
+                    if isinstance(mp_tx, dict):
+                        logger.info(f"[PIX] mp_tx.keys={list(mp_tx.keys())}")
+            except Exception:
+                pass
+
             if success:
-                # 1) Envia QR primeiro
+                # Monta texto
+                text = [
+                    "💳 **Pagamento da Assinatura (PIX)**",
+                    f"💰 Valor: **R$ {amount:.2f}**",
+                    "",
+                    "🧾 Pague usando **uma** das opções abaixo:"
+                ]
+                if pay_link:
+                    text.append(f"🔗 Link de pagamento:\n{pay_link}")
+                if copia_cola:
+                    text.extend(["", "📋 **Copia e Cola PIX:**", f"`{copia_cola}`"])
+
+                keyboard = [[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]
+
+                # Envia QR se base64 presente
                 if qr_b64:
                     try:
                         import base64, io
@@ -1681,68 +1841,25 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                     except Exception as e:
                         logger.error(f"Erro ao enviar QR: {e}")
 
-                # 2) Monta texto com instruções
-                parts = [
-                    "💳 **Pagamento da Assinatura (PIX)**",
-                    f"💰 Valor: **R$ {amount:.2f}**",
-                    "",
-                    "🧾 Pague usando **uma** das opções abaixo:"
-                ]
-                if pay_link:
-                    parts.append(f"🔗 Link de pagamento:\n{pay_link}")
-                if copia_cola:
-                    parts.extend([
-                        "",
-                        "📋 **Copia e Cola PIX:**",
-                        _format_pix_copy_code(copia_cola)
-                    ])
-
-                # Quando o copia-e-cola está presente, evitar Markdown na mensagem principal
-                parse_mode_main = None if copia_cola else "Markdown"
-
-                try:
-                    await query.edit_message_text(
-                        "\n".join(parts),
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                        parse_mode=parse_mode_main
-                    )
-                except Exception as e:
-                    logger.error(f"edit_message_text falhou, fallback para texto puro: {e}")
-                    try:
-                        await query.edit_message_text(
-                            "\n".join(parts),
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                            parse_mode=None
-                        )
-                    except Exception as e2:
-                        logger.error(f"edit_message_text (texto puro) falhou: {e2}")
-
-                # 3) Mensagem separada só com o copia-e-cola (texto puro, fácil de copiar)
-                if copia_cola:
-                    try:
-                        pretty = _format_pix_copy_code(copia_cola)
-                        await context.bot.send_message(
-                            chat_id=query.message.chat_id,
-                            text=f"📋 Copia e Cola PIX:\n{pretty}",
-                            parse_mode=None
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar copia-e-cola separado: {e}")
-
+                await query.edit_message_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
                 return
 
-            # Fallback quando nenhum dado de pagamento veio
+            # ---- Fallback (nada veio)
+            fallback_text = (
+    "⚠️ **Pagamento PIX indisponível no momento.**\n\n"
+    "Verifique se o método `create_subscription_payment` está sendo chamado e se o token do Mercado Pago está definido.\n"
+    "Toque em **Menu Principal** e tente novamente mais tarde."
+)
             await query.edit_message_text(
-                "⚠️ Pagamento PIX indisponível no momento.\n\n"
-                "Verifique se o método create_subscription_payment está sendo chamado e se o token do Mercado Pago está definido.\n"
-                "Toque em Menu Principal e tente novamente mais tarde.",
+                fallback_text,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                parse_mode=None
+                parse_mode="Markdown"
             )
 
     except Exception as e:
         logger.error(f"subscribe_now_callback error: {e}")
         await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
+
 async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """(Opcional) Verificar status do pagamento se suportado."""
     if not update.callback_query:
