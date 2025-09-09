@@ -1860,42 +1860,85 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"subscribe_now_callback error: {e}")
         await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
 
+
 async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Opcional) Verificar status do pagamento se suportado."""
+    """Confirma status do pagamento e ativa assinatura."""
     if not update.callback_query:
         return
-    query = update.callback_query
-    await query.answer()
 
+    q = update.callback_query
+    data = q.data or ""
     payment_id = None
+    if data.startswith("check_payment:"):
+        payment_id = data.split(":", 1)[1].strip() or None
+
     try:
-        data = query.data or ""
-        if data.startswith("check_payment_"):
-            payment_id = data.replace("check_payment_", "").strip()
+        await q.answer()
+    except Exception:
+        pass
 
-        status = None
-        if payment_id and hasattr(payment_service, "check_payment_status"):
-            status = payment_service.check_payment_status(payment_id)
+    try:
+        with db_service.get_session() as session:
+            tg_user = q.from_user
+            db_user = session.query(User).filter_by(telegram_id=str(tg_user.id)).first()
+            if not db_user:
+                await q.edit_message_text("❌ Usuário não encontrado. Use /start para se registrar.")
+                return
 
-        if status and status.get("paid"):
-            await query.edit_message_text(
-                "✅ **Pagamento confirmado!** Sua assinatura foi ativada.\n\n"
-                "Toque em **Menu Principal** para continuar.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+            if not payment_id:
+                await q.edit_message_text("❌ Não consegui identificar o pagamento. Tente pelo botão da tela de pagamento.")
+                return
+
+            # Consulta no provedor
+            status = payment_service.check_payment_status(str(payment_id))
+            ok = bool(status.get("success")) and status.get("status") in {"approved"}
+            detail = status.get("status_detail")
+
+            if ok:
+                # Ativa assinatura (campos tolerantes)
+                from datetime import datetime, timedelta
+                expires = datetime.now() + timedelta(days=30)
+
+                # Campos mais comuns
+                if hasattr(db_user, "is_trial"):
+                    db_user.is_trial = False
+                if hasattr(db_user, "is_active"):
+                    db_user.is_active = True
+                # tenta vários nomes de validade
+                for field in ["subscription_expires_at", "subscription_until", "premium_until", "paid_until", "expires_at"]:
+                    if hasattr(db_user, field):
+                        setattr(db_user, field, expires)
+
+                # salva um flag de última confirmação
+                if hasattr(db_user, "last_payment_id"):
+                    db_user.last_payment_id = str(payment_id)
+
+                session.commit()
+
+                await q.edit_message_text(
+                    "✅ Pagamento confirmado e assinatura ativada!\n"
+                    f"📅 Válida até: {expires.strftime('%d/%m/%Y')}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                    parse_mode=None
+                )
+                return
+
+            # Ainda pendente / não aprovado
+            await q.edit_message_text(
+                "⏳ Ainda não consta como aprovado.\n"
+                f"Status: {status.get('status')} ({detail})\n"
+                "Toque em **Já paguei** novamente em alguns instantes.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Já paguei (verificar de novo)", callback_data=f"check_payment:{payment_id}")]]),
                 parse_mode="Markdown"
             )
-        else:
-            await query.edit_message_text(
-                "⏳ Pagamento ainda **não confirmado**.\n\nTente novamente em alguns instantes.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Tentar novamente", callback_data=query.data)],
-                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")],
-                ]),
-                parse_mode="Markdown"
-            )
+
     except Exception as e:
         logger.error(f"check_payment_callback error: {e}")
-        await query.edit_message_text("❌ Erro ao verificar pagamento.")
+        try:
+            await q.edit_message_text("❌ Erro ao verificar pagamento. Tente novamente.")
+        except Exception:
+            pass
+
 
 
 
