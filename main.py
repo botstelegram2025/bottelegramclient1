@@ -1695,8 +1695,7 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                     "🧾 Pague usando **uma** das opções abaixo:"
                 ]
                 if pay_link:
-                    text.append(f"🔗 Link de pagamento:
-{pay_link}")
+                    text.append(f"🔗 Link de pagamento:\n{pay_link}")
                 if copia_cola:
                     text.extend(["", "📋 **Copia e Cola PIX:**", f"`{copia_cola}`"])
 
@@ -1714,26 +1713,21 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                         await context.bot.send_photo(
                             chat_id=query.message.chat_id,
                             photo=qr_photo,
-                            caption="📲 **QR Code PIX**
-Escaneie para pagar.",
+                            caption="📲 **QR Code PIX**\nEscaneie para pagar.",
                             parse_mode="Markdown"
                         )
                     except Exception as e:
                         logger.error(f"Erro ao enviar QR: {e}")
 
-                await query.edit_message_text("
-".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+                await query.edit_message_text("\n".join(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
                 return
 
             # ---- Fallback (nada veio)
             fallback_text = (
-                "⚠️ **Pagamento PIX indisponível no momento.**
-
-"
-                "Verifique se o método `create_subscription_payment` está sendo chamado e se o token do Mercado Pago está definido.
-"
-                "Toque em **Menu Principal** e tente novamente mais tarde."
-            )
+    "⚠️ **Pagamento PIX indisponível no momento.**\n\n"
+    "Verifique se o método `create_subscription_payment` está sendo chamado e se o token do Mercado Pago está definido.\n"
+    "Toque em **Menu Principal** e tente novamente mais tarde."
+)
             await query.edit_message_text(
                 fallback_text,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
@@ -1744,7 +1738,7 @@ Escaneie para pagar.",
         logger.error(f"subscribe_now_callback error: {e}")
         await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
 
-sync def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """(Opcional) Verificar status do pagamento se suportado."""
     if not update.callback_query:
         return
