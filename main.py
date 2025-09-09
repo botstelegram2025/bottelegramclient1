@@ -75,20 +75,6 @@ from services.whatsapp_service import whatsapp_service
 from services.payment_service import payment_service
 from models import User, Client, Subscription, MessageTemplate, MessageLog
 
-
-# ---- SAFE GUARD: ensure helper exists even if file is partially merged elsewhere ----
-if "_format_pix_copy_code" not in globals():
-    def _format_pix_copy_code(code: str, chunk: int = 36) -> str:
-        try:
-            code = str(code).strip()
-            if not code:
-                return ""
-            return "\n".join(code[i:i+chunk] for i in range(0, len(code), chunk))
-        except Exception:
-            return str(code)
-# -------------------------------------------------------------------------------------
-
-
 # Conversation states
 WAITING_FOR_PHONE = 1
 WAITING_CLIENT_NAME = 2
@@ -1677,23 +1663,7 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
             success = bool(qr_b64 or copia_cola or pay_link)
 
             if success:
-                text = [
-                    "💳 **Pagamento da Assinatura (PIX)**",
-                    f"💰 Valor: **R$ {amount:.2f}**",
-                    "",
-                    "🧾 Pague usando **uma** das opções abaixo:"
-                ]
-                if pay_link:
-                    text.append(f"🔗 Link de pagamento:\\n{pay_link}")
-                if copia_cola:
-                    text.extend([
-                        "",
-                        "📋 **Copia e Cola PIX:**",
-                        _format_pix_copy_code(copia_cola)
-                    ])
-
-                keyboard = [[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]
-
+                # 1) Envia QR primeiro
                 if qr_b64:
                     try:
                         import base64, io
@@ -1705,40 +1675,69 @@ async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_T
                         await context.bot.send_photo(
                             chat_id=query.message.chat_id,
                             photo=qr_photo,
-                            caption="📲 **QR Code PIX**\\nEscaneie para pagar.",
+                            caption="📲 **QR Code PIX**\nEscaneie para pagar.",
                             parse_mode="Markdown"
                         )
                     except Exception as e:
                         logger.error(f"Erro ao enviar QR: {e}")
 
-                await query.edit_message_text(
-                    "\\n".join(text),
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                # 2) Monta texto com instruções
+                parts = [
+                    "💳 **Pagamento da Assinatura (PIX)**",
+                    f"💰 Valor: **R$ {amount:.2f}**",
+                    "",
+                    "🧾 Pague usando **uma** das opções abaixo:"
+                ]
+                if pay_link:
+                    parts.append(f"🔗 Link de pagamento:\n{pay_link}")
+                if copia_cola:
+                    parts.extend([
+                        "",
+                        "📋 **Copia e Cola PIX:**",
+                        _format_pix_copy_code(copia_cola)
+                    ])
 
+                # Quando o copia-e-cola está presente, evitar Markdown na mensagem principal
+                parse_mode_main = None if copia_cola else "Markdown"
+
+                try:
+                    await query.edit_message_text(
+                        "\n".join(parts),
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                        parse_mode=parse_mode_main
+                    )
+                except Exception as e:
+                    logger.error(f"edit_message_text falhou, fallback para texto puro: {e}")
+                    try:
+                        await query.edit_message_text(
+                            "\n".join(parts),
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                            parse_mode=None
+                        )
+                    except Exception as e2:
+                        logger.error(f"edit_message_text (texto puro) falhou: {e2}")
+
+                # 3) Mensagem separada só com o copia-e-cola (texto puro, fácil de copiar)
                 if copia_cola:
                     try:
                         pretty = _format_pix_copy_code(copia_cola)
                         await context.bot.send_message(
                             chat_id=query.message.chat_id,
-                            text=f"📋 Copia e Cola PIX:\\n{pretty}",
+                            text=f"📋 Copia e Cola PIX:\n{pretty}",
                             parse_mode=None
                         )
                     except Exception as e:
-                        logger.error(f"Erro ao enviar copia-e-cola: {e}")
+                        logger.error(f"Erro ao enviar copia-e-cola separado: {e}")
 
                 return
 
-            fallback_text = (
-                "⚠️ **Pagamento PIX indisponível no momento.**\\n\\n"
-                "Verifique se o método `create_subscription_payment` está sendo chamado e se o token do Mercado Pago está definido.\\n"
-                "Toque em **Menu Principal** e tente novamente mais tarde."
-            )
+            # Fallback quando nenhum dado de pagamento veio
             await query.edit_message_text(
-                fallback_text,
+                "⚠️ Pagamento PIX indisponível no momento.\n\n"
+                "Verifique se o método create_subscription_payment está sendo chamado e se o token do Mercado Pago está definido.\n"
+                "Toque em Menu Principal e tente novamente mais tarde.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
-                parse_mode="Markdown"
+                parse_mode=None
             )
 
     except Exception as e:
