@@ -1580,9 +1580,157 @@ async def subscription_info_callback(update: Update, context: ContextTypes.DEFAU
 # === PIX / Assinatura ===
 
 # === PIX / Assinatura — compatível com create_subscription_payment ===
+
 async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.callback_query:
         return
+
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        from datetime import datetime
+        with db_service.get_session() as session:
+            tg_user = query.from_user
+            db_user = session.query(User).filter_by(telegram_id=str(tg_user.id)).first()
+            if not db_user:
+                await query.edit_message_text("❌ Usuário não encontrado. Use /start para se registrar.")
+                return
+
+            amount = getattr(Config, "MONTHLY_SUBSCRIPTION_PRICE", 20.00) or 20.00
+            description = "Assinatura Mensal - Bot Gestor"
+
+            result = None
+            try:
+                if hasattr(payment_service, "create_subscription_payment"):
+                    try:
+                        result = payment_service.create_subscription_payment(
+                            user_telegram_id=str(tg_user.id), amount=amount, method="pix"
+                        )
+                    except TypeError:
+                        result = payment_service.create_subscription_payment(str(tg_user.id), amount)
+            except Exception as e:
+                logger.error(f"create_subscription_payment error: {e}")
+
+            if not result:
+                try:
+                    if hasattr(payment_service, "create_pix_subscription"):
+                        result = payment_service.create_pix_subscription(user_id=db_user.id, amount=amount, description=description)
+                    elif hasattr(payment_service, "create_pix_payment"):
+                        result = payment_service.create_pix_payment(user_id=db_user.id, amount=amount, description=description)
+                    elif hasattr(payment_service, "create_payment"):
+                        result = payment_service.create_payment(user_id=db_user.id, amount=amount, description=description, method="pix")
+                except Exception as e:
+                    logger.error(f"payment_service fallback error: {e}")
+                    result = {"error": str(e)}
+
+            raw = result or {}
+
+            def get_nested(d, path, default=None):
+                cur = d
+                for p in path.split("."):
+                    if not isinstance(cur, dict) or p not in cur:
+                        return default
+                    cur = cur[p]
+                return cur
+
+            mp_tx = get_nested(raw, "point_of_interaction.transaction_data", {}) or {}
+
+            qr_b64 = (
+                raw.get("qr_code_base64")
+                or raw.get("qrCodeBase64")
+                or mp_tx.get("qr_code_base64")
+                or mp_tx.get("qr_code_base64_image")
+                or get_nested(raw, "transaction_data.qr_code_base64")
+            )
+
+            copia_cola = (
+                raw.get("copy_paste")
+                or raw.get("copia_cola")
+                or raw.get("pix_code")
+                or mp_tx.get("qr_code")
+                or raw.get("qr_code")
+                or get_nested(raw, "transaction_data.qr_code")
+            )
+
+            pay_link = (
+                raw.get("payment_link")
+                or raw.get("checkout_url")
+                or get_nested(raw, "point_of_interaction.transaction_data.ticket_url")
+                or get_nested(raw, "point_of_interaction.transaction_data.url")
+                or raw.get("init_point")
+            )
+
+            success = bool(qr_b64 or copia_cola or pay_link)
+
+            if success:
+                text = [
+                    "💳 **Pagamento da Assinatura (PIX)**",
+                    f"💰 Valor: **R$ {amount:.2f}**",
+                    "",
+                    "🧾 Pague usando **uma** das opções abaixo:"
+                ]
+                if pay_link:
+                    text.append(f"🔗 Link de pagamento:\n{pay_link}")
+                if copia_cola:
+                    text.extend([
+                        "",
+                        "📋 **Copia e Cola PIX:**",
+                        _format_pix_copy_code(copia_cola)
+                    ])
+
+                keyboard = [[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]
+
+                if qr_b64:
+                    try:
+                        import base64, io
+                        if isinstance(qr_b64, str) and qr_b64.startswith("data:image"):
+                            qr_b64 = qr_b64.split(",")[1]
+                        qr_bytes = base64.b64decode(qr_b64) if isinstance(qr_b64, str) else qr_b64
+                        qr_photo = io.BytesIO(qr_bytes)
+                        qr_photo.name = "pix_qr_code.png"
+                        await context.bot.send_photo(
+                            chat_id=query.message.chat_id,
+                            photo=qr_photo,
+                            caption="📲 **QR Code PIX**\nEscaneie para pagar.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        logger.error(f"Erro ao enviar QR: {e}")
+
+                await query.edit_message_text(
+                    "\n".join(text),
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+
+                if copia_cola:
+                    try:
+                        pretty = _format_pix_copy_code(copia_cola)
+                        await context.bot.send_message(
+                            chat_id=query.message.chat_id,
+                            text=f"📋 Copia e Cola PIX:\n{pretty}",
+                            parse_mode=None
+                        )
+                    except Exception as e:
+                        logger.error(f"Erro ao enviar copia-e-cola: {e}")
+
+                return
+
+            fallback_text = (
+                "⚠️ **Pagamento PIX indisponível no momento.**\n\n"
+                "Verifique se o método `create_subscription_payment` está sendo chamado e se o token do Mercado Pago está definido.\n"
+                "Toque em **Menu Principal** e tente novamente mais tarde."
+            )
+            await query.edit_message_text(
+                fallback_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"subscribe_now_callback error: {e}")
+        await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
 
     query = update.callback_query
     await query.answer()
@@ -6313,6 +6461,18 @@ async def cancel_specific_sending_callback(update: Update, context: ContextTypes
             keyboard = []
             for client in clients[:10]:  # Limit to first 10 clients
                 from datetime import date
+
+
+def _format_pix_copy_code(code: str, chunk: int = 36) -> str:
+    try:
+        code = str(code).strip()
+        if not code:
+            return ""
+        return "\\n".join(code[i:i+chunk] for i in range(0, len(code), chunk))
+    except Exception:
+        return str(code)
+
+
                 days_until_due = (client.due_date - date.today()).days
                 status_emoji = "🚨" if days_until_due <= 0 else "⚠️" if days_until_due <= 2 else "📅"
                 
