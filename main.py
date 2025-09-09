@@ -6580,51 +6580,38 @@ def _get_telegram_bot_instance():
         logger.error(f"[WEBHOOK] Falha ao instanciar Bot: {e}")
         return None
 
+
 @app.route("/webhook/mercadopago", methods=["POST", "GET"])
 def mercadopago_webhook():
     try:
         if request.method == "GET":
-            # Resposta para verificações simples
             return "OK", 200
 
         payload = request.get_json(silent=True) or {}
-        # MP pode mandar: {"type":"payment","data":{"id":"<payment_id>"}}
-        payment_id = None
-        if isinstance(payload, dict):
-            if "data" in payload and isinstance(payload["data"], dict) and payload.get("type") in ("payment", "payments"):
-                payment_id = payload["data"].get("id")
-            # fallback: vêm como {resource: ".../payments/<id>"}
-            if not payment_id and "resource" in payload and isinstance(payload["resource"], str):
-                import re as _re
-                m = _re.search(r"/payments/(\d+)", payload["resource"])
-                if m:
-                    payment_id = m.group(1)
+        result = payment_service.process_webhook(payload)
 
-        # fallback por query strings (algumas integrações usam)
-        if not payment_id:
-            payment_id = request.args.get("id") or request.args.get("payment_id")
+        if not result.get("success"):
+            logger.error(f"[WEBHOOK] payload inválido/sem payment_id: {payload}")
+            return jsonify({"ok": False, "error": "invalid", "details": result}), 200
 
-        if not payment_id:
-            logger.error(f"[WEBHOOK] payload sem payment_id: {payload}")
-            return jsonify({"ok": False, "error": "payment_id ausente"}), 200
+        payment_id = result.get("payment_id")
+        status = result.get("status")
+        paid = result.get("paid") or (status == "approved")
+        payment_raw = result.get("raw") or {}
+        tg_id = result.get("telegram_id")
 
-        # Confirma status no provedor
-        status = payment_service.check_payment_status(str(payment_id))
-        approved = bool(status.get("success")) and status.get("status") == "approved"
-        payment = status.get("raw") or status.get("payment_data") or {}
+        # Fallback: tenta extrair do payment bruto
+        if not tg_id:
+            tg_id = _extract_tg_id_from_payment(payment_raw)
 
-        if approved:
-            tg_id = _extract_tg_id_from_payment(payment)
-            if not tg_id:
-                logger.error(f"[WEBHOOK] payment aprovado, mas sem telegram_id. payment_id={payment_id}")
-                return jsonify({"ok": True, "warn": "approved_without_tg_id"}), 200
-
+        if paid and tg_id:
             try:
                 with db_service.get_session() as session:
                     db_user = session.query(User).filter_by(telegram_id=str(tg_id)).first()
                     if not db_user:
                         logger.error(f"[WEBHOOK] usuário não encontrado para telegram_id={tg_id}")
                         return jsonify({"ok": True, "warn": "user_not_found"}), 200
+
                     expires = _activate_user_subscription(session, db_user, str(payment_id))
 
                 # Notifica usuário
@@ -6640,16 +6627,13 @@ def mercadopago_webhook():
                 logger.error(f"[WEBHOOK] erro ao ativar assinatura: {e}")
                 return jsonify({"ok": False, "error": "db_error"}), 200
 
-        # Não aprovado ainda; respondemos 200 para MP repetir depois, se for o caso.
-        logger.info(f"[WEBHOOK] pagamento não aprovado ainda: id={payment_id} status={status.get('status')}")
-        return jsonify({"ok": True, "status": status.get("status")}), 200
+        # Caso não aprovado ainda
+        logger.info(f"[WEBHOOK] pagamento ainda não aprovado: id={payment_id} status={status}")
+        return jsonify({"ok": True, "status": status}), 200
 
     except Exception as e:
         logger.error(f"[WEBHOOK] erro inesperado: {e}")
         return jsonify({"ok": False, "error": "unexpected"}), 200
-
-
-
 
 # ===== Inicialização do servidor Flask em thread separada =====
 def _run_flask():
