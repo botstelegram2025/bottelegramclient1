@@ -6515,6 +6515,12 @@ if __name__ == '__main__':
 # ===== Mercado Pago Webhook (Flask) =====
 app = Flask(__name__)
 
+# Ensure Mercado Pago webhook is registered on this app
+try:
+    register_mp_webhook(app)
+except Exception as _e:
+    logger.error('[WEBHOOK] register_mp_webhook failed: ' + str(_e))
+
 def _extract_tg_id_from_payment(payment: dict) -> str:
     """Extrai o telegram_id do external_reference/description/metadata."""
     if not isinstance(payment, dict):
@@ -6746,39 +6752,93 @@ def _start_flask_webhook():
 
 
 
-# ===== Start Flask on import (single-run guard) =====
-__FLASK_WEBHOOK_STARTED = False
 
-def _run_flask():
-    import os
-    host = os.getenv("FLASK_HOST", "0.0.0.0")
+# ==== Inlined Mercado Pago Webhook Blueprint ====
+from flask import Blueprint, request, jsonify, Flask
+mp_webhook_bp = Blueprint("mp_webhook", __name__)
+
+def _handle_mp_webhook_request():
     try:
-        from config import Config
-        port = getattr(Config, "WEBHOOK_PORT", None) or int(os.getenv("PORT", "8080"))
+        # Payment ID detection (JSON or querystring)
+        payment_id = None
+        payload = request.get_json(silent=True) or {}
+
+        if isinstance(payload, dict):
+            if payload.get("type") in {"payment", "payments"} and isinstance(payload.get("data"), dict):
+                payment_id = payload["data"].get("id") or payment_id
+            res = payload.get("resource")
+            if not payment_id and isinstance(res, str) and "/payments/" in res:
+                m = _re.search(r"/payments/(\d+)", res)
+                if m:
+                    payment_id = m.group(1)
+
+        if not payment_id:
+            payment_id = request.args.get("id") or request.args.get("data.id")
+
+        if not payment_id and request.form:
+            payment_id = request.form.get("id") or request.form.get("data.id")
+
+        if not payment_id:
+            logger.error(f"[WEBHOOK] missing payment_id: payload={payload} args={dict(request.args)} form={dict(request.form)}")
+            return {"ok": False, "error": "missing_payment_id"}, 200
+
+        logger.info(f"[WEBHOOK] recebido payment_id={payment_id}")
+
+        if not payment_service:
+            return {"ok": False, "error": "payment_service_unavailable"}, 200
+
+        status = payment_service.check_payment_status(str(payment_id))
+        if not status.get("success"):
+            logger.error(f"[WEBHOOK] status lookup falhou: {status}")
+            return {"ok": False, "error": "status_lookup_failed"}, 200
+
+        paid = bool(status.get("paid")) or (status.get("status") == "approved")
+        payment_raw = status.get("raw") or {}
+        tg_id = status.get("telegram_id") or _extract_tg_id_from_payment(payment_raw)
+
+        if paid and tg_id and db_service and User:
+            try:
+                with db_service.get_session() as session:
+                    db_user = session.query(User).filter_by(telegram_id=str(tg_id)).first()
+                    if not db_user:
+                        logger.error(f"[WEBHOOK] usuário não encontrado para telegram_id={tg_id}")
+                        return {"ok": True, "warn": "user_not_found"}, 200
+                    expires = _activate_user_subscription(session, db_user, str(payment_id))
+
+                _notify_user_paid_http(int(tg_id), expires)
+                return {"ok": True, "status": "approved"}, 200
+
+            except Exception as e:
+                logger.error(f"[WEBHOOK] erro ao ativar assinatura: {e}")
+                return {"ok": False, "error": "db_error"}, 200
+
+        return {"ok": True, "status": status.get("status")}, 200
+
+    except Exception as e:
+        logger.error(f"[WEBHOOK] erro inesperado: {e}")
+        return {"ok": False, "error": "unexpected"}, 200
+
+@mp_webhook_bp.route("/mercadopago", methods=["POST", "GET", "HEAD"])
+def mercadopago_webhook():
+    if request.method in ("GET", "HEAD"):
+        return "OK", 200
+    body, code = _handle_mp_webhook_request()
+    return jsonify(body), code
+
+def register_mp_webhook(app: Flask):
+    """Registra blueprint e rotas diretas para evitar 404."""
+    # Evita duplicar
+    existing = [str(r) for r in app.url_map.iter_rules()]
+    if "/webhook/mercadopago" not in "".join(existing):
+        app.register_blueprint(mp_webhook_bp, url_prefix="/webhook")
+        app.add_url_rule("/webhook/mercadopago", view_func=mercadopago_webhook, methods=["POST", "GET", "HEAD"])
+        app.add_url_rule("/webhook/mercadopago/", view_func=mercadopago_webhook, methods=["POST", "GET", "HEAD"])
+        logger.info("[WEBHOOK] Rotas registradas: /webhook/mercadopago e /webhook/mercadopago/")
+
+    # Log de rotas para diagnóstico
+    try:
+        routes = [str(r) for r in app.url_map.iter_rules()]
+        logger.info("[WEBHOOK] Rotas Flask ativas: " + ", ".join(routes))
     except Exception:
-        port = int(os.getenv("PORT", "8080"))
-    _log_routes()
-    logger.info(f"[WEBHOOK] Flask ouvindo em http://{host}:{port}/webhook/mercadopago")
-    try:
-        app.run(host=host, port=port, threaded=True, debug=False)
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Flask app.run error: {e}")
-
-def _start_flask_webhook():
-    global __FLASK_WEBHOOK_STARTED
-    if __FLASK_WEBHOOK_STARTED:
-        return
-    __FLASK_WEBHOOK_STARTED = True
-    try:
-        import threading
-        t = threading.Thread(target=_run_flask, daemon=True)
-        t.start()
-    except Exception as e:
-        logger.error(f"[WEBHOOK] falha ao iniciar Flask: {e}")
-
-# Start immediately to avoid missing early callbacks in some runners
-try:
-    _start_flask_webhook()
-except Exception as e:
-    logger.error(f"[WEBHOOK] auto-start failed: {e}")
+        pass
 
