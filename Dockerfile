@@ -11,9 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# --- Node deps ---
-COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+# --- Node deps (copy package.json and optionally the lockfile) ---
+COPY package.json package-lock.json* ./
+# Prefer ci when lock is valid; fall back to install if out-of-sync
+RUN bash -lc '\
+  if [ -f package-lock.json ]; then \
+    echo \"Using npm ci (lock present)\" && \
+    npm ci --omit=dev || \
+    (echo \"npm ci failed; retrying with --legacy-peer-deps\" && npm ci --omit=dev --legacy-peer-deps) || \
+    (echo \"Falling back to npm install (removing lock)\" && rm -f package-lock.json && npm install --omit=dev --legacy-peer-deps); \
+  else \
+    echo \"No lock file; using npm install\" && npm install --omit=dev --legacy-peer-deps; \
+  fi'
 
 # --- Python deps ---
 COPY requirements.txt ./
@@ -22,27 +31,22 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # --- App code ---
 COPY . .
 
-# Ensure sessions dir exists (used by Baileys or your app)
 RUN mkdir -p sessions
 
-# --- Environment ---
 ENV NODE_ENV=production \
     PYTHONUNBUFFERED=1 \
-    FLASK_HOST=0.0.0.0
+    FLASK_HOST=0.0.0.0 \
+    PORT=8080
 
-# Railway injects $PORT at runtime. Default to 8080 for local runs.
-ENV PORT=8080
-
-# --- Expose (docs only) ---
+# Expose for docs
 EXPOSE 8080
 EXPOSE 3001
 
-# --- Healthcheck: require BOTH Flask (on $PORT) and Node (3001) ---
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+# Healthcheck: both Flask ($PORT) and Node (3001) must be up
+HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 \
   CMD bash -lc 'curl -fsS http://127.0.0.1:${PORT}/health && curl -fsS http://127.0.0.1:3001/health || exit 1'
 
-# --- Entrypoint boots both Node and Python ---
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-CMD ["/app/entrypoint.sh"]
+CMD [\"/app/entrypoint.sh\"]
