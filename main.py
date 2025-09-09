@@ -1575,6 +1575,147 @@ async def subscription_info_callback(update: Update, context: ContextTypes.DEFAU
         logger.error(f"Error showing subscription info: {e}")
         await query.edit_message_text("❌ Erro ao carregar informações da assinatura.")
 
+
+
+# === PIX / Assinatura ===
+async def subscribe_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia o fluxo de pagamento (PIX) para assinatura."""
+    if not update.callback_query:
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        with db_service.get_session() as session:
+            tg_user = query.from_user
+            db_user = session.query(User).filter_by(telegram_id=str(tg_user.id)).first()
+            if not db_user:
+                await query.edit_message_text("❌ Usuário não encontrado. Use /start para se registrar.")
+                return
+
+            amount = 20.00
+            description = "Assinatura Mensal - Bot Gestor"
+
+            result = None
+
+            try:
+                if hasattr(payment_service, "create_pix_subscription"):
+                    result = payment_service.create_pix_subscription(user_id=db_user.id, amount=amount, description=description)
+                elif hasattr(payment_service, "create_pix_payment"):
+                    result = payment_service.create_pix_payment(user_id=db_user.id, amount=amount, description=description)
+                elif hasattr(payment_service, "create_payment"):
+                    result = payment_service.create_payment(user_id=db_user.id, amount=amount, description=description, method="pix")
+            except Exception as e:
+                logger.error(f"payment_service error: {e}")
+                result = {"success": False, "error": str(e)}
+
+            success = bool(result and result.get("success"))
+            qr_b64 = None
+            copia_cola = None
+            pay_link = None
+
+            if result:
+                qr_b64 = result.get("qr_code_base64") or result.get("qrCodeBase64") or result.get("qrCode") or result.get("qr_code")
+                copia_cola = result.get("copy_paste") or result.get("pix_code") or result.get("copia_cola") or result.get("copyAndPaste")
+                pay_link = result.get("payment_link") or result.get("point_of_interaction_url") or result.get("checkout_url")
+
+            if success and (qr_b64 or copia_cola or pay_link):
+                parts = []
+                parts.append("💳 **Pagamento da Assinatura (PIX)**")
+                parts.append(f"💰 Valor: **R$ {amount:.2f}**")
+                parts.append("")
+                parts.append("🧾 Pague usando **qualquer uma** das opções abaixo:")
+
+                if pay_link:
+                    parts.append(f"🔗 Link de pagamento:\n{pay_link}")
+
+                if copia_cola:
+                    parts.append("")
+                    parts.append("📋 **Copia e Cola PIX:**")
+                    parts.append(f"`{copia_cola}`")
+
+                keyboard = [
+                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                # Envia QR se houver
+                if qr_b64:
+                    try:
+                        import base64, io
+                        if qr_b64.startswith("data:image"):
+                            qr_b64 = qr_b64.split(",")[1]
+                        qr_bytes = base64.b64decode(qr_b64)
+                        qr_photo = io.BytesIO(qr_bytes)
+                        qr_photo.name = "pix_qr_code.png"
+                        await context.bot.send_photo(
+                            chat_id=query.message.chat_id,
+                            photo=qr_photo,
+                            caption="📲 **QR Code PIX**\nEscaneie para pagar.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        logger.error(f"Erro ao enviar QR: {e}")
+
+                await query.edit_message_text("\n".join(parts), reply_markup=reply_markup, parse_mode="Markdown")
+
+            else:
+                fallback_text = (
+                    "⚠️ **Pagamento PIX indisponível no momento.**\n\n"
+                    "Se preferir, me diga e eu ativo a assinatura manualmente assim que o pagamento for confirmado.\n"
+                    "Ou toque em **Menu Principal** e tente novamente mais tarde."
+                )
+                await query.edit_message_text(
+                    fallback_text,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                    parse_mode="Markdown"
+                )
+
+    except Exception as e:
+        logger.error(f"subscribe_now_callback error: {e}")
+        await update.callback_query.edit_message_text("❌ Erro ao iniciar pagamento. Tente novamente.")
+
+
+async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Opcional) Verificar status do pagamento se suportado."""
+    if not update.callback_query:
+        return
+    query = update.callback_query
+    await query.answer()
+
+    payment_id = None
+    try:
+        data = query.data or ""
+        if data.startswith("check_payment_"):
+            payment_id = data.replace("check_payment_", "").strip()
+
+        status = None
+        if payment_id and hasattr(payment_service, "check_payment_status"):
+            status = payment_service.check_payment_status(payment_id)
+
+        if status and status.get("paid"):
+            await query.edit_message_text(
+                "✅ **Pagamento confirmado!** Sua assinatura foi ativada.\n\n"
+                "Toque em **Menu Principal** para continuar.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]]),
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                "⏳ Pagamento ainda **não confirmado**.\n\nTente novamente em alguns instantes.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Tentar novamente", callback_data=query.data)],
+                    [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")],
+                ]),
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"check_payment_callback error: {e}")
+        await query.edit_message_text("❌ Erro ao verificar pagamento.")
+
+
+
 async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle WhatsApp status callback and show QR code if needed"""
     if not update.callback_query:
@@ -5260,8 +5401,8 @@ def main():
         # Template handlers already implemented above - no external imports needed
         
         # Payment system handlers - disabled temporarily (functions need to be implemented)
-        # application.add_handler(CallbackQueryHandler(subscribe_now_callback, pattern="^subscribe_now$"))
-        # application.add_handler(CallbackQueryHandler(check_payment_callback, pattern="^check_payment_.*$"))
+        application.add_handler(CallbackQueryHandler(subscribe_now_callback, pattern="^subscribe_now$"))
+        application.add_handler(CallbackQueryHandler(check_payment_callback, pattern="^check_payment_.*$"))
 
         # Other callbacks
         application.add_handler(CallbackQueryHandler(dashboard_callback, pattern="^dashboard$"))
