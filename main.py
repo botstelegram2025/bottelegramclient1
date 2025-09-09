@@ -6744,3 +6744,41 @@ def _start_flask_webhook():
     except Exception as e:
         logger.error(f"[WEBHOOK] falha ao iniciar Flask: {e}")
 
+
+
+# ===== Start Flask on import (single-run guard) =====
+__FLASK_WEBHOOK_STARTED = False
+
+def _run_flask():
+    import os
+    host = os.getenv("FLASK_HOST", "0.0.0.0")
+    try:
+        from config import Config
+        port = getattr(Config, "WEBHOOK_PORT", None) or int(os.getenv("PORT", "8080"))
+    except Exception:
+        port = int(os.getenv("PORT", "8080"))
+    _log_routes()
+    logger.info(f"[WEBHOOK] Flask ouvindo em http://{host}:{port}/webhook/mercadopago")
+    try:
+        app.run(host=host, port=port, threaded=True, debug=False)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Flask app.run error: {e}")
+
+def _start_flask_webhook():
+    global __FLASK_WEBHOOK_STARTED
+    if __FLASK_WEBHOOK_STARTED:
+        return
+    __FLASK_WEBHOOK_STARTED = True
+    try:
+        import threading
+        t = threading.Thread(target=_run_flask, daemon=True)
+        t.start()
+    except Exception as e:
+        logger.error(f"[WEBHOOK] falha ao iniciar Flask: {e}")
+
+# Start immediately to avoid missing early callbacks in some runners
+try:
+    _start_flask_webhook()
+except Exception as e:
+    logger.error(f"[WEBHOOK] auto-start failed: {e}")
+
