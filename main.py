@@ -132,7 +132,8 @@ def get_client_keyboard():
     """Get client management persistent keyboard"""
     keyboard = [
         [KeyboardButton("➕ Adicionar Cliente"), KeyboardButton("📋 Ver Clientes")],
-        [KeyboardButton("📊 Dashboard"), KeyboardButton("🏠 Menu Principal")]
+        [KeyboardButton("🔍 Buscar Cliente"), KeyboardButton("📊 Dashboard")],
+        [KeyboardButton("🏠 Menu Principal")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
 
@@ -579,7 +580,7 @@ O que deseja fazer?
             await update.callback_query.message.reply_text("❌ Erro ao carregar menu.")
 
 async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle dashboard callback"""
+    """Handle dashboard callback - Clear financial overview"""
     if not update.callback_query or not update.callback_query.from_user:
         return
         
@@ -596,169 +597,116 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await query.edit_message_text("❌ Usuário não encontrado.")
                 return
             
-            # Get statistics
-            total_clients = session.query(Client).filter_by(user_id=db_user.id).count()
-            active_clients = session.query(Client).filter_by(user_id=db_user.id, status='active').count()
-            
-            # Get clients expiring soon
+            # Get current month info
             today = date.today()
-            expiring_soon = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date <= today + timedelta(days=7),
-                Client.due_date >= today
-            ).count()
-            
-            # Monthly statistics - current month
             from calendar import monthrange
+            from sqlalchemy import and_, or_
             current_year = today.year
             current_month = today.month
             month_start = date(current_year, current_month, 1)
             month_end = date(current_year, current_month, monthrange(current_year, current_month)[1])
             
-            # Monthly financial calculations - clients due this month
-            clients_due_query = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date >= month_start,
-                Client.due_date <= month_end
-            )
-            clients_to_pay = clients_due_query.count()
+            # 1. VALORES RECEBIDOS (Clientes que pagaram no mês atual)
+            received_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.last_payment_date >= month_start,
+                    Client.last_payment_date <= month_end
+                )
+            ).all()
             
-            # Calculate total revenue for the month (all clients due)
-            monthly_revenue_total = sum(client.plan_price or 0 for client in clients_due_query.all())
+            received_count = len(received_clients)
+            received_total = sum(client.plan_price or 0 for client in received_clients)
             
-            # Clients that already paid this month (payment date within this month)
-            clients_paid_query = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.last_payment_date >= month_start,
-                Client.last_payment_date <= month_end
-            )
-            clients_paid = clients_paid_query.count()
+            # 2. VALORES A RECEBER (Clientes que vencem hoje ou no futuro e não pagaram este mês)
+            pending_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.due_date >= today,  # Apenas vencimentos de hoje em diante
+                    Client.due_date <= month_end,
+                    or_(
+                        Client.last_payment_date.is_(None),
+                        Client.last_payment_date < month_start  # Não pagou neste mês
+                    )
+                )
+            ).all()
             
-            # Calculate revenue from clients who already paid this month
-            revenue_paid = sum(client.plan_price or 0 for client in clients_paid_query.all())
+            pending_count = len(pending_clients)
+            pending_total = sum(client.plan_price or 0 for client in pending_clients)
             
-            # Revenue still to be collected
-            revenue_pending = monthly_revenue_total - revenue_paid
-            
-            # Get overdue clients (vencidos)
+            # 3. VALORES EM ATRASO (Clientes vencidos e que não pagaram)
             overdue_clients = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date < today
-            ).count()
-            overdue_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date < today
-            ).all())
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.due_date < today,  # Já venceu
+                    or_(
+                        Client.last_payment_date.is_(None),
+                        Client.last_payment_date < Client.due_date  # Não pagou após o vencimento
+                    )
+                )
+            ).all()
             
-            # Get clients due today
-            due_today = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date == today
-            ).count()
-            due_today_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date == today
-            ).all())
+            overdue_count = len(overdue_clients)
+            overdue_total = sum(client.plan_price or 0 for client in overdue_clients)
             
-            # Get clients paid in last 30 days (renovados)
-            from datetime import datetime
-            thirty_days_ago = today - timedelta(days=30)
-            clients_renewed = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.last_payment_date >= thirty_days_ago,
-                Client.last_payment_date <= today
-            ).count()
-            renewal_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.last_payment_date >= thirty_days_ago,
-                Client.last_payment_date <= today
-            ).all())
+            # Valores em atraso que faziam parte do mês vigente (para total correto)
+            overdue_this_month_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.due_date >= month_start,
+                    Client.due_date < today,  # Venceram neste mês
+                    or_(
+                        Client.last_payment_date.is_(None),
+                        Client.last_payment_date < Client.due_date
+                    )
+                )
+            ).all()
             
-            # Get upcoming clients (next 7 days)
-            upcoming_clients = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date > today,
-                Client.due_date <= today + timedelta(days=7)
-            ).count()
-            upcoming_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date > today,
-                Client.due_date <= today + timedelta(days=7)
-            ).all())
+            overdue_this_month_total = sum(client.plan_price or 0 for client in overdue_this_month_clients)
             
-            # Annual statistics
-            year_start = date(current_year, 1, 1)
-            annual_paid = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.last_payment_date >= year_start,
-                Client.last_payment_date <= today
-            ).count()
-            annual_revenue = sum(client.plan_price or 0 for client in session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.last_payment_date >= year_start,
-                Client.last_payment_date <= today
-            ).all())
+            # Estatísticas gerais
+            total_clients = session.query(Client).filter_by(user_id=db_user.id).count()
+            active_clients = session.query(Client).filter_by(user_id=db_user.id, status='active').count()
             
-            # Total potential annual revenue
-            total_annual_potential = sum(client.plan_price * 12 if client.plan_price else 0 for client in session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active'
-            ).all())
+            # Total do mês vigente (inclui atrasados que venceram neste mês)
+            month_total = received_total + pending_total + overdue_this_month_total
+            
+            # Calcular saldo restante correto
+            remaining_total = month_total - received_total
             
             dashboard_text = f"""
-📊 **Dashboard - Gestão Financeira**
+📊 **Dashboard Financeiro - {month_start.strftime('%m/%Y')}**
 
-👥 **Resumo Geral:**
-• Total: {total_clients} clientes
-• Ativos: {active_clients} | Inativos: {total_clients - active_clients}
+💰 **VALORES RECEBIDOS**
+✅ **{received_count} clientes** pagaram
+💵 **R$ {received_total:.2f}** recebido
 
-💰 **Status de Pagamento:**
-✅ **PAGOS (Renovados - 30 dias):** {clients_renewed} 
-   💵 Recebido: R$ {renewal_revenue:.2f}
+📋 **VALORES A RECEBER**
+⏳ **{pending_count} clientes** ainda devem
+💰 **R$ {pending_total:.2f}** a receber
 
-⏰ **VENCEM HOJE:** {due_today} 
-   💰 A receber: R$ {due_today_revenue:.2f}
+❌ **VALORES EM ATRASO**
+🔴 **{overdue_count} clientes** atrasados
+💸 **R$ {overdue_total:.2f}** em atraso
 
-🔔 **PRÓXIMOS 7 DIAS:** {upcoming_clients}
-   💰 A receber: R$ {upcoming_revenue:.2f}
+📊 **RESUMO DO MÊS**
+• **Total previsto:** R$ {month_total:.2f}
+• **Já recebido:** R$ {received_total:.2f} ({(received_total/month_total*100 if month_total > 0 else 0):.0f}%)
+• **Ainda falta:** R$ {remaining_total:.2f}
 
-❌ **VENCIDOS:** {overdue_clients}
-   💸 Em atraso: R$ {overdue_revenue:.2f}
+👥 **CLIENTES GERAIS**
+• **Total:** {total_clients} clientes
+• **Ativos:** {active_clients} | **Inativos:** {total_clients - active_clients}
 
-📈 **Resumo Financeiro:**
-**Mês Atual ({month_start.strftime('%m/%Y')}):**
-• 📈 Pagos: {clients_paid} (R$ {revenue_paid:.2f})
-• 📋 A Pagar: {clients_to_pay - clients_paid} (R$ {revenue_pending:.2f})
-• 💵 **Total Mensal**: R$ {monthly_revenue_total:.2f}
-
-**Ano {current_year}:**
-• 💰 Pagamentos recebidos: {annual_paid}
-• 🏆 Receita anual: R$ {annual_revenue:.2f}
-• 🎯 Potencial anual: R$ {total_annual_potential:.2f}
-
-📱 **WhatsApp:**
-• Status: {"✅ Conectado" if whatsapp_service.check_instance_status(db_user.id).get('connected') else "❌ Desconectado"}
-
-💳 **Assinatura:**
-• Status: {"🆓 Teste" if db_user.is_trial else "💎 Premium"}
+💳 **Status:** {"🆓 Teste" if db_user.is_trial else "💎 Premium"}
+📱 **WhatsApp:** {"✅ Conectado" if whatsapp_service.check_instance_status(db_user.id).get('connected') else "❌ Desconectado"}
 """
             
-            dashboard_text += "\n📲 Use o teclado abaixo para navegar"
-            
-            reply_markup = get_main_keyboard()
+            reply_markup = get_main_keyboard(db_user)
             
             await query.message.reply_text(
                 dashboard_text,
@@ -1210,6 +1158,39 @@ async def show_main_menu_message(message, context):
         )
     except Exception as e:
         logger.error(f"Error showing main menu: {e}")
+
+async def restore_persistent_keyboard(update, context=None, db_user=None):
+    """Helper to restore persistent keyboard after conversations end"""
+    try:
+        if not db_user and update.effective_user:
+            with db_service.get_session() as session:
+                db_user = session.query(User).filter_by(telegram_id=str(update.effective_user.id)).first()
+        
+        if db_user:
+            main_keyboard = get_main_keyboard(db_user)
+            
+            # Handle both message and callback query contexts
+            if update.message:
+                await update.message.reply_text(
+                    "🏠 **Menu Principal**\n\nUse os botões abaixo para navegar:", 
+                    reply_markup=main_keyboard, 
+                    parse_mode='Markdown'
+                )
+            elif update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(
+                    "🏠 **Menu Principal**\n\nUse os botões abaixo para navegar:", 
+                    reply_markup=main_keyboard, 
+                    parse_mode='Markdown'
+                )
+            elif context and update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="🏠 **Menu Principal**\n\nUse os botões abaixo para navegar:",
+                    reply_markup=main_keyboard,
+                    parse_mode='Markdown'
+                )
+    except Exception as e:
+        logger.error(f"Error restoring persistent keyboard: {e}")
 
 async def add_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle add client callback"""
@@ -1716,12 +1697,21 @@ async def save_client_to_database(update: Update, context: ContextTypes.DEFAULT_
             
             await update.message.reply_text(success_message, reply_markup=reply_markup, parse_mode='Markdown')
             
+            # Restore persistent keyboard after client registration
+            await restore_persistent_keyboard(update, context, db_user)
+            
             # Clear context
             context.user_data.clear()
+            
+            return ConversationHandler.END
             
     except Exception as e:
         logger.error(f"Error saving client: {e}")
         await update.message.reply_text("❌ Erro ao cadastrar cliente. Tente novamente.")
+        
+        # Restore persistent keyboard even on error
+        await restore_persistent_keyboard(update, context)
+            
         return ConversationHandler.END
 
 async def subscription_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1833,8 +1823,8 @@ async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT
                     [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
                 ]
                 
-            elif status.get('success') and status.get('qrCode'):
-                # Not connected but has QR - show QR status
+            elif status.get('success') and not status.get('connected') and status.get('qrCode'):
+                # Not connected but has QR - show QR status with both connection options
                 status_text = """📱 **WhatsApp - Aguardando Conexão**
 
 🔄 Escaneie o QR Code para conectar
@@ -1842,6 +1832,7 @@ async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT
                 
                 keyboard = [
                     [InlineKeyboardButton("🔄 Novo QR", callback_data="whatsapp_status")],
+                    [InlineKeyboardButton("🔢 Código Pareamento", callback_data="whatsapp_pairing_code")],
                     [InlineKeyboardButton("🔌 Reconectar", callback_data="whatsapp_reconnect")],
                     [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
                 ]
@@ -1879,7 +1870,7 @@ async def whatsapp_status_callback(update: Update, context: ContextTypes.DEFAULT
                 
                 keyboard = [
                     [InlineKeyboardButton("📱 QR Code", callback_data="whatsapp_reconnect")],
-
+                    [InlineKeyboardButton("🔢 Código Pareamento", callback_data="whatsapp_pairing_code")],
                     [InlineKeyboardButton("🔄 Atualizar", callback_data="whatsapp_status")],
                     [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
                 ]
@@ -2062,11 +2053,148 @@ Tente novamente em alguns segundos."""
         logger.error(f"❌ Error in whatsapp_reconnect_callback: {e}")
         await query.edit_message_text("❌ Erro ao reconectar WhatsApp.")
 
-# Pairing code functionality completely removed - caused WhatsApp connection conflicts
+# WhatsApp Pairing Code functionality
+WAITING_PHONE_NUMBER = "waiting_phone_number"
 
-# All pairing code functionality has been completely removed
+async def whatsapp_pairing_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle WhatsApp pairing code connection request"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not update.effective_user:
+        return ConversationHandler.END
+        
+    user = update.effective_user
+    
+    try:
+        # Explain pairing code process
+        pairing_text = """📱 **Conectar WhatsApp via Código**
 
-# Pairing code cancellation function also removed
+O código de pareamento é uma alternativa ao QR Code:
+
+1️⃣ Digite seu número de telefone com DDD
+2️⃣ Receba um código de 8 dígitos
+3️⃣ No WhatsApp: Configurações → Aparelhos conectados → Conectar um aparelho
+4️⃣ Escolha "Conectar com código de telefone"
+5️⃣ Digite o código de 8 dígitos
+
+**Digite seu número com DDD:**
+Exemplo: 11987654321"""
+        
+        cancel_keyboard = [
+            [InlineKeyboardButton("❌ Cancelar", callback_data="whatsapp_status")]
+        ]
+        cancel_markup = InlineKeyboardMarkup(cancel_keyboard)
+        
+        await query.edit_message_text(
+            pairing_text,
+            reply_markup=cancel_markup,
+            parse_mode='Markdown'
+        )
+        
+        return WAITING_PHONE_NUMBER
+        
+    except Exception as e:
+        logger.error(f"❌ Error in whatsapp_pairing_code_callback: {e}")
+        await query.edit_message_text("❌ Erro ao iniciar processo de pareamento.")
+        return ConversationHandler.END
+
+async def handle_pairing_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle phone number input for pairing code"""
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+        
+    user = update.effective_user
+    phone_input = update.message.text.strip()
+    
+    try:
+        # Normalize phone number to WhatsApp format (55 + DDD + 9 + 8 digits)
+        from services.whatsapp_service import normalize_brazilian_phone
+        normalized_phone = normalize_brazilian_phone(phone_input)
+        
+        # Ensure country code 55 for Brazil
+        if not normalized_phone.startswith('55'):
+            normalized_phone = '55' + normalized_phone
+        
+        if len(normalized_phone) < 12 or len(normalized_phone) > 13:
+            await update.message.reply_text(
+                "❌ **Número inválido**\n\nDigite um número válido com DDD.\n"
+                "Exemplo: 11987654321",
+                parse_mode='Markdown'
+            )
+            return WAITING_PHONE_NUMBER
+        
+        # Show progress message
+        progress_msg = await update.message.reply_text("🔄 Gerando código de pareamento...")
+        
+        # Request pairing code
+        whatsapp_service = WhatsAppService()
+        result = whatsapp_service.request_pairing_code(user.id, normalized_phone)
+        
+        if result.get('success'):
+            pairing_code = result.get('pairing_code')
+            
+            success_text = f"""✅ **Código de Pareamento Gerado**
+
+📱 **Número:** {normalized_phone}
+🔢 **Código:** `{pairing_code}`
+
+**Como usar:**
+1. Abra o WhatsApp no celular
+2. Vá em Configurações → Aparelhos conectados
+3. Toque em "Conectar um aparelho"
+4. Escolha "Conectar com código de telefone"
+5. Digite o código: `{pairing_code}`
+
+⏰ **Importante:** O código expira em alguns minutos."""
+            
+            success_keyboard = [
+                [InlineKeyboardButton("🔄 Verificar Conexão", callback_data="whatsapp_status")],
+                [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+            ]
+            success_markup = InlineKeyboardMarkup(success_keyboard)
+            
+            await progress_msg.edit_text(
+                success_text,
+                reply_markup=success_markup,
+                parse_mode='Markdown'
+            )
+            
+        else:
+            error_msg = result.get('error', 'Erro desconhecido')
+            error_text = f"""❌ **Erro ao gerar código**
+
+{error_msg}
+
+Tente novamente ou use o QR Code."""
+            
+            error_keyboard = [
+                [InlineKeyboardButton("🔄 Tentar QR Code", callback_data="whatsapp_reconnect")],
+                [InlineKeyboardButton("🔄 Status WhatsApp", callback_data="whatsapp_status")],
+                [InlineKeyboardButton("🏠 Menu Principal", callback_data="main_menu")]
+            ]
+            error_markup = InlineKeyboardMarkup(error_keyboard)
+            
+            await progress_msg.edit_text(
+                error_text,
+                reply_markup=error_markup,
+                parse_mode='Markdown'
+            )
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"❌ Error in handle_pairing_phone_number: {e}")
+        await update.message.reply_text("❌ Erro ao processar número de telefone.")
+        return ConversationHandler.END
+
+async def cancel_pairing_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel pairing code conversation"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await whatsapp_status_callback(update, context)
+    return ConversationHandler.END
 
 async def schedule_settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show schedule settings menu"""
@@ -2268,9 +2396,41 @@ async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_
         await early_payment_message(update, context)
     elif text == "🚀 Forçar Hoje":
         await force_process_reminders_today(update, context)
+    elif text == "🔍 Buscar Cliente":
+        await search_client_message(update, context)
     else:
         # Log unknown button presses
         logger.warning(f"handle_keyboard_buttons: Unknown button pressed: '{text}' by user {update.effective_user.id if update.effective_user else 'None'}")
+
+async def search_client_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle search client from keyboard - Ask user to type client name"""
+    if not update.effective_user:
+        return
+        
+    user = update.effective_user
+    
+    try:
+        with db_service.get_session() as session:
+            db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
+            
+            if not db_user or not db_user.is_active:
+                await update.message.reply_text("❌ Conta inativa.", reply_markup=get_client_keyboard())
+                return
+            
+            text = """🔍 **Buscar Cliente**
+
+Digite o nome do cliente que você quer encontrar:
+
+💡 *Pode digitar apenas parte do nome*"""
+            
+            await update.message.reply_text(text, reply_markup=get_client_keyboard(), parse_mode='Markdown')
+            
+            # Set user state for search
+            context.user_data['searching_client'] = True
+            
+    except Exception as e:
+        logger.error(f"Error starting client search: {e}")
+        await update.message.reply_text("❌ Erro ao iniciar busca.", reply_markup=get_client_keyboard())
 
 async def early_payment_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle early payment for trial users - Direct to payment"""
@@ -2338,7 +2498,7 @@ Deseja continuar com o pagamento antecipado?
         await update.message.reply_text("❌ Erro ao carregar opções de pagamento.")
 
 async def manage_clients_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle manage clients from keyboard - Show client list with inline buttons"""
+    """Handle manage clients from keyboard - Show client list with persistent keyboard"""
     if not update.effective_user:
         return
         
@@ -2349,11 +2509,11 @@ async def manage_clients_message(update: Update, context: ContextTypes.DEFAULT_T
             db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
             
             if not db_user:
-                await update.message.reply_text("❌ Usuário não encontrado.")
+                await update.message.reply_text("❌ Usuário não encontrado.", reply_markup=get_client_keyboard())
                 return
             
             if not db_user.is_active:
-                await update.message.reply_text("⚠️ Conta inativa. Assine o plano para continuar.")
+                await update.message.reply_text("⚠️ Conta inativa. Assine o plano para continuar.", reply_markup=get_client_keyboard())
                 return
             
             # Get clients ordered by due date (descending - most urgent first)
@@ -2365,19 +2525,12 @@ async def manage_clients_message(update: Update, context: ContextTypes.DEFAULT_T
 
 📋 Nenhum cliente cadastrado ainda.
 
-Comece adicionando seu primeiro cliente!
+Comece adicionando seu primeiro cliente usando o botão abaixo!
 """
-                keyboard = [
-                    [InlineKeyboardButton("➕ Adicionar Cliente", callback_data="add_client")],
-                    [InlineKeyboardButton("🔍 Buscar Cliente", callback_data="search_client")],
-                    [InlineKeyboardButton("🔙 Menu Principal", callback_data="main_menu")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+                await update.message.reply_text(text, reply_markup=get_client_keyboard(), parse_mode='Markdown')
                 return
             
-            # Create client list with inline buttons
+            # Create client list with inline buttons for individual clients only
             from datetime import date
             today = date.today()
             
@@ -2402,19 +2555,17 @@ Comece adicionando seu primeiro cliente!
                 
                 keyboard.append([InlineKeyboardButton(button_text, callback_data=f"client_{client.id}")])
             
-            # Add navigation buttons
-            keyboard.extend([
-                [InlineKeyboardButton("➕ Adicionar Cliente", callback_data="add_client")],
-                [InlineKeyboardButton("🔍 Buscar Cliente", callback_data="search_client")],
-                [InlineKeyboardButton("🔙 Menu Principal", callback_data="main_menu")]
-            ])
+            # Send message with client list AND persistent keyboard for navigation
+            await update.message.reply_text(text, reply_markup=get_client_keyboard(), parse_mode='Markdown')
             
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            # Send additional message with client selection buttons if there are clients
+            if keyboard:
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text("📋 **Selecione um cliente:**", reply_markup=reply_markup, parse_mode='Markdown')
             
     except Exception as e:
         logger.error(f"Error managing clients: {e}")
-        await update.message.reply_text("❌ Erro ao carregar clientes.")
+        await update.message.reply_text("❌ Erro ao carregar clientes.", reply_markup=get_client_keyboard())
 
 async def client_details_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show client details and submenu"""
@@ -3945,7 +4096,7 @@ async def handle_edit_other_info(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 async def dashboard_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle dashboard from keyboard"""
+    """Handle dashboard from keyboard - Clear financial overview"""
     if not update.effective_user:
         return
         
@@ -3959,79 +4110,116 @@ async def dashboard_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Usuário não encontrado.")
                 return
             
-            # Get statistics
-            total_clients = session.query(Client).filter_by(user_id=db_user.id).count()
-            active_clients = session.query(Client).filter_by(user_id=db_user.id, status='active').count()
-            
-            # Get clients expiring soon
+            # Get current month info
             today = date.today()
-            expiring_soon = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date <= today + timedelta(days=7),
-                Client.due_date >= today
-            ).count()
-            
-            # Monthly statistics - current month
             from calendar import monthrange
+            from sqlalchemy import and_, or_
             current_year = today.year
             current_month = today.month
             month_start = date(current_year, current_month, 1)
             month_end = date(current_year, current_month, monthrange(current_year, current_month)[1])
             
-            # Monthly financial calculations - clients due this month
-            clients_due_query = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.due_date >= month_start,
-                Client.due_date <= month_end
-            )
-            clients_to_pay = clients_due_query.count()
+            # 1. VALORES RECEBIDOS (Clientes que pagaram no mês atual)
+            received_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.last_payment_date >= month_start,
+                    Client.last_payment_date <= month_end
+                )
+            ).all()
             
-            # Calculate total revenue for the month (all clients due)
-            monthly_revenue_total = sum(client.plan_price or 0 for client in clients_due_query.all())
+            received_count = len(received_clients)
+            received_total = sum(client.plan_price or 0 for client in received_clients)
             
-            # Clients that already paid this month (payment date within this month)
-            clients_paid_query = session.query(Client).filter(
-                Client.user_id == db_user.id,
-                Client.status == 'active',
-                Client.last_payment_date >= month_start,
-                Client.last_payment_date <= month_end
-            )
-            clients_paid = clients_paid_query.count()
+            # 2. VALORES A RECEBER (Clientes que vencem hoje ou no futuro e não pagaram este mês)
+            pending_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.due_date >= today,  # Apenas vencimentos de hoje em diante
+                    Client.due_date <= month_end,
+                    or_(
+                        Client.last_payment_date.is_(None),
+                        Client.last_payment_date < month_start  # Não pagou neste mês
+                    )
+                )
+            ).all()
             
-            # Calculate revenue from clients who already paid this month
-            revenue_paid = sum(client.plan_price or 0 for client in clients_paid_query.all())
+            pending_count = len(pending_clients)
+            pending_total = sum(client.plan_price or 0 for client in pending_clients)
             
-            # Revenue still to be collected
-            revenue_pending = monthly_revenue_total - revenue_paid
+            # 3. VALORES EM ATRASO (Clientes vencidos e que não pagaram)
+            overdue_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.due_date < today,  # Já venceu
+                    or_(
+                        Client.last_payment_date.is_(None),
+                        Client.last_payment_date < Client.due_date  # Não pagou após o vencimento
+                    )
+                )
+            ).all()
+            
+            overdue_count = len(overdue_clients)
+            overdue_total = sum(client.plan_price or 0 for client in overdue_clients)
+            
+            # Valores em atraso que faziam parte do mês vigente (para total correto)
+            overdue_this_month_clients = session.query(Client).filter(
+                and_(
+                    Client.user_id == db_user.id,
+                    Client.status == 'active',
+                    Client.due_date >= month_start,
+                    Client.due_date < today,  # Venceram neste mês
+                    or_(
+                        Client.last_payment_date.is_(None),
+                        Client.last_payment_date < Client.due_date
+                    )
+                )
+            ).all()
+            
+            overdue_this_month_total = sum(client.plan_price or 0 for client in overdue_this_month_clients)
+            
+            # Estatísticas gerais
+            total_clients = session.query(Client).filter_by(user_id=db_user.id).count()
+            active_clients = session.query(Client).filter_by(user_id=db_user.id, status='active').count()
+            
+            # Total do mês vigente (inclui atrasados que venceram neste mês)
+            month_total = received_total + pending_total + overdue_this_month_total
+            
+            # Calcular saldo restante correto
+            remaining_total = month_total - received_total
             
             dashboard_text = f"""
-📊 **Dashboard - Visão Geral**
+📊 **Dashboard Financeiro - {month_start.strftime('%m/%Y')}**
 
-👥 **Clientes:**
-• Total: {total_clients}
-• Ativos: {active_clients}
-• Inativos: {total_clients - active_clients}
+💰 **VALORES RECEBIDOS**
+✅ **{received_count} clientes** pagaram
+💵 **R$ {received_total:.2f}** recebido
 
-💰 **Mês Atual ({month_start.strftime('%m/%Y')}):**
-• 📈 Pagos: {clients_paid} (R$ {revenue_paid:.2f})
-• 📋 A Pagar: {clients_to_pay - clients_paid} (R$ {revenue_pending:.2f})
-• 💵 Faturamento Total: R$ {monthly_revenue_total:.2f}
+📋 **VALORES A RECEBER**
+⏳ **{pending_count} clientes** ainda devem
+💰 **R$ {pending_total:.2f}** a receber
 
-⏰ **Vencimentos:**
-• Próximos 7 dias: {expiring_soon}
+❌ **VALORES EM ATRASO**
+🔴 **{overdue_count} clientes** atrasados
+💸 **R$ {overdue_total:.2f}** em atraso
 
-📱 **WhatsApp:**
-• Status: {"✅ Conectado" if whatsapp_service.check_instance_status(db_user.id).get('connected') else "❌ Desconectado"}
+📊 **RESUMO DO MÊS**
+• **Total previsto:** R$ {month_total:.2f}
+• **Já recebido:** R$ {received_total:.2f} ({(received_total/month_total*100 if month_total > 0 else 0):.0f}%)
+• **Ainda falta:** R$ {remaining_total:.2f}
 
-💳 **Assinatura:**
-• Status: {"🆓 Teste" if db_user.is_trial else "💎 Premium"}
+👥 **CLIENTES GERAIS**
+• **Total:** {total_clients} clientes
+• **Ativos:** {active_clients} | **Inativos:** {total_clients - active_clients}
 
-📲 Use o teclado abaixo para navegar
+💳 **Status:** {"🆓 Teste" if db_user.is_trial else "💎 Premium"}
+📱 **WhatsApp:** {"✅ Conectado" if whatsapp_service.check_instance_status(db_user.id).get('connected') else "❌ Desconectado"}
 """
             
-            reply_markup = get_main_keyboard()
+            reply_markup = get_main_keyboard(db_user)
             await update.message.reply_text(dashboard_text, reply_markup=reply_markup, parse_mode='Markdown')
             
     except Exception as e:
@@ -5410,12 +5598,28 @@ def main():
             per_message=False
         )
         
+        # WhatsApp Pairing Code conversation handler
+        pairing_code_handler = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(whatsapp_pairing_code_callback, pattern="^whatsapp_pairing_code$")
+            ],
+            states={
+                WAITING_PHONE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pairing_phone_number)],
+            },
+            fallbacks=[
+                CallbackQueryHandler(cancel_pairing_code, pattern="^whatsapp_status$"),
+                CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")
+            ],
+            per_message=False
+        )
+        
         # Register conversation handlers FIRST (highest priority)
         application.add_handler(user_registration_handler)
         application.add_handler(client_addition_handler)
         application.add_handler(edit_client_handler)
         application.add_handler(renew_client_handler)
         application.add_handler(schedule_settings_handler)
+        application.add_handler(pairing_code_handler)
         
         # Command handlers
         application.add_handler(CommandHandler("help", help_command))
@@ -5432,6 +5636,7 @@ def main():
             "^❓ Ajuda$",
             "^🏠 Menu Principal$",
             "^📋 Ver Clientes$",
+            "^🔍 Buscar Cliente$",
             "^🚀 PAGAMENTO ANTECIPADO$"
         ]
         
@@ -5502,7 +5707,8 @@ def main():
         application.add_handler(CallbackQueryHandler(whatsapp_disconnect_callback, pattern="^whatsapp_disconnect$"))
         application.add_handler(CallbackQueryHandler(whatsapp_reconnect_callback, pattern="^whatsapp_reconnect$"))
         
-        # WhatsApp Pairing Code handler removed - functionality disabled due to conflicts
+        # WhatsApp Pairing Code button handler - now reactivated
+        application.add_handler(CallbackQueryHandler(whatsapp_pairing_code_callback, pattern="^whatsapp_pairing_code$"))
         application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
         
         # Unknown callback handler
@@ -5695,11 +5901,19 @@ Tente novamente:""", parse_mode='Markdown')
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+            # Restore persistent keyboard after schedule configuration
+            await restore_persistent_keyboard(update, context, db_user)
+            
             return ConversationHandler.END
             
     except Exception as e:
         logger.error(f"Error processing schedule time setting: {e}")
         await update.message.reply_text("❌ Erro ao configurar horário.")
+        
+        # Restore persistent keyboard even on error
+        await restore_persistent_keyboard(update, context)
+            
         return ConversationHandler.END
 
 async def process_time_setting(update: Update, context: ContextTypes.DEFAULT_TYPE, time_input: str):
@@ -5765,9 +5979,19 @@ async def process_time_setting(update: Update, context: ContextTypes.DEFAULT_TYP
             
             await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
             
+            # Restore persistent keyboard after time configuration
+            await restore_persistent_keyboard(update, context, db_user)
+            
+            return ConversationHandler.END
+            
     except Exception as e:
         logger.error(f"Error processing time setting: {e}")
         await update.message.reply_text("❌ Erro ao configurar horário.")
+        
+        # Restore persistent keyboard even on error
+        await restore_persistent_keyboard(update, context)
+        
+        return ConversationHandler.END
 
 def validate_time_format(time_str: str) -> bool:
     """Validate time format HH:MM"""

@@ -848,11 +848,106 @@ app.post('/force-qr/:userId', async (req, res) => {
     }
 });
 
-// Endpoint para código de pareamento
-// Pairing code endpoint removed - functionality disabled
+// Endpoint para código de pareamento (POST)
+app.post('/pairing-code/:userId', async (req, res) => {
+    const userId = req.params.userId;
+    const { phoneNumber } = req.body;
+    
+    if (!phoneNumber) {
+        return res.status(400).json({
+            success: false,
+            error: 'Phone number is required'
+        });
+    }
+    
+    try {
+        let session = getUserSession(userId);
+        
+        // Set phone number for pairing
+        session.phoneNumber = phoneNumber;
+        
+        // If already connected, no pairing needed
+        if (session.isConnected) {
+            return res.json({
+                success: false,
+                error: 'WhatsApp is already connected for this user'
+            });
+        }
+        
+        // If already have a pairing code for this number, return it
+        if (session.pairingCode && session.phoneNumber === phoneNumber) {
+            return res.json({
+                success: true,
+                pairingCode: session.pairingCode,
+                phoneNumber: phoneNumber
+            });
+        }
+        
+        // Start session to generate pairing code
+        await session.start();
+        
+        // Wait for pairing code generation with timeout
+        let attempts = 0;
+        const maxAttempts = 20; // 10 seconds
+        
+        return new Promise((resolve) => {
+            const checkPairingCode = () => {
+                attempts++;
+                
+                if (session.pairingCode) {
+                    resolve(res.json({
+                        success: true,
+                        pairingCode: session.pairingCode,
+                        phoneNumber: phoneNumber
+                    }));
+                } else if (attempts >= maxAttempts) {
+                    resolve(res.status(408).json({
+                        success: false,
+                        error: 'Timeout waiting for pairing code generation'
+                    }));
+                } else {
+                    setTimeout(checkPairingCode, 500);
+                }
+            };
+            
+            checkPairingCode();
+        });
+        
+    } catch (error) {
+        console.error('❌ Error generating pairing code:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to generate pairing code',
+            details: error.message
+        });
+    }
+});
 
-// Endpoint para buscar código de pareamento existente
-// GET pairing code endpoint removed - functionality disabled
+// Endpoint para buscar código de pareamento existente (GET)
+app.get('/pairing-code/:userId', (req, res) => {
+    const userId = req.params.userId;
+    const session = userSessions.get(userId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'User session not found'
+        });
+    }
+    
+    if (!session.pairingCode) {
+        return res.json({
+            success: false,
+            error: 'No pairing code available. Generate one first with POST request.'
+        });
+    }
+    
+    res.json({
+        success: true,
+        pairingCode: session.pairingCode,
+        phoneNumber: session.phoneNumber
+    });
+});
 
 // Endpoint para listar todos os usuários conectados (admin)
 app.get('/sessions', (req, res) => {

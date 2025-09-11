@@ -42,6 +42,8 @@ Preferred communication style: Simple, everyday language.
 - **Caching System**: LRU cache with TTL support for performance optimization
 - **Input Validation**: Comprehensive data sanitization and security checks
 - **Health Monitoring**: Real-time system metrics and health check endpoints
+- **Automatic Daily Reset**: Daily reset at midnight (00:00) São Paulo time to clear reminder flags and ensure reliable daily processing
+- **Manual Override System**: Force reminder processing button for immediate troubleshooting and testing
 
 ### Deployment Architecture
 - **Platform**: Railway cloud platform with Nixpacks build system
