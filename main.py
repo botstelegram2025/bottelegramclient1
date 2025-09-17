@@ -4966,9 +4966,9 @@ async def show_template_type_selection(update: Update, template_name: str):
     
     keyboard = [
         [InlineKeyboardButton("🎉 Boas-vindas", callback_data="template_type_welcome")],
-        [InlineKeyboardButton("📅 Lembrete 2 dias antes", callback_data="template_type_reminder_2days")],
-        [InlineKeyboardButton("⏰ Lembrete 1 dia antes", callback_data="template_type_reminder_1day")],
-        [InlineKeyboardButton("🚨 Lembrete no vencimento", callback_data="template_type_reminder_due")],
+        [InlineKeyboardButton("📅 Lembrete 2 dias antes", callback_data="template_type_reminder_2_days")],
+        [InlineKeyboardButton("⏰ Lembrete 1 dia antes", callback_data="template_type_reminder_1_day")],
+        [InlineKeyboardButton("🚨 Lembrete no vencimento", callback_data="template_type_reminder_due_date")],
         [InlineKeyboardButton("❌ Lembrete após vencimento", callback_data="template_type_reminder_overdue")],
         [InlineKeyboardButton("✅ Renovação confirmada", callback_data="template_type_renewal")],
         [InlineKeyboardButton("🔧 Personalizado", callback_data="template_type_custom")],
@@ -5019,9 +5019,9 @@ async def show_template_content_input(query, template_name: str, template_type: 
     """Show template content input - Step 3"""
     type_names = {
         'welcome': 'Boas-vindas',
-        'reminder_2days': 'Lembrete 2 dias antes',
-        'reminder_1day': 'Lembrete 1 dia antes',
-        'reminder_due': 'Lembrete no vencimento',
+        'reminder_2_days': 'Lembrete 2 dias antes',
+        'reminder_1_day': 'Lembrete 1 dia antes',
+        'reminder_due_date': 'Lembrete no vencimento',
         'reminder_overdue': 'Lembrete após vencimento',
         'renewal': 'Renovação confirmada',
         'custom': 'Personalizado'
