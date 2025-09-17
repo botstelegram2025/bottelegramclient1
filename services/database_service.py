@@ -1,23 +1,41 @@
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.pool import QueuePool
 from contextlib import contextmanager
 import logging
+import os
+
 from config import Config
 from models import Base, User, Client, Subscription, MessageTemplate, MessageLog, SystemSettings
 
 logger = logging.getLogger(__name__)
 
+# OBS: garanta que TODO o código importe "db_service" (singleton) e
+# NUNCA faça DatabaseService() em outros módulos.
+
 class DatabaseService:
     def __init__(self):
+        db_url = Config.DATABASE_URL
+
+        # Pool controlado para não estourar o limite do Postgres na Railway
         self.engine = create_engine(
-            Config.DATABASE_URL,
-            pool_pre_ping=True,
-            pool_recycle=300,
+            db_url,
+            poolclass=QueuePool,
+            pool_size=int(os.getenv("DB_POOL_SIZE", "5")),   # ajuste conforme seu plano
+            max_overflow=int(os.getenv("DB_POOL_MAX_OVERFLOW", "0")),  # não estourar
+            pool_pre_ping=True,          # valida conexão antes de usar
+            pool_recycle=1800,           # recicla a cada 30min
+            pool_use_lifo=True,          # reutiliza as conexões mais novas
             echo=False
         )
-        self.SessionLocal = scoped_session(sessionmaker(bind=self.engine))
+
+        # Sessões que não expiram objetos após commit (evita re-loads desnecessários)
+        self._SessionFactory = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.SessionLocal = scoped_session(self._SessionFactory)
+
+        # Criar/migrar tabelas (executa rápido e é idempotente)
         self.create_tables()
-    
+
     def create_tables(self):
         """Create all database tables"""
         try:
@@ -27,18 +45,17 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error creating database tables: {e}")
             raise
-    
+
     def _migrate_existing_tables(self):
         """Add new columns to existing tables if they don't exist"""
         try:
             with self.engine.connect() as connection:
-                # Check if reminder_status column exists in clients table
+                # clients.reminder_status
                 result = connection.execute(text("""
                     SELECT column_name 
                     FROM information_schema.columns 
                     WHERE table_name='clients' AND column_name='reminder_status'
                 """))
-                
                 if not result.fetchone():
                     logger.info("Adding reminder_status column to clients table")
                     connection.execute(text("""
@@ -46,14 +63,13 @@ class DatabaseService:
                         ADD COLUMN reminder_status VARCHAR(20) DEFAULT 'pending'
                     """))
                     connection.commit()
-                
-                # Check if last_reminder_sent column exists in clients table
+
+                # clients.last_reminder_sent
                 result = connection.execute(text("""
                     SELECT column_name 
                     FROM information_schema.columns 
                     WHERE table_name='clients' AND column_name='last_reminder_sent'
                 """))
-                
                 if not result.fetchone():
                     logger.info("Adding last_reminder_sent column to clients table")
                     connection.execute(text("""
@@ -61,14 +77,13 @@ class DatabaseService:
                         ADD COLUMN last_reminder_sent DATE
                     """))
                     connection.commit()
-                
-                # Check if is_default column exists in message_templates table
+
+                # message_templates.is_default
                 result = connection.execute(text("""
                     SELECT column_name 
                     FROM information_schema.columns 
                     WHERE table_name='message_templates' AND column_name='is_default'
                 """))
-                
                 if not result.fetchone():
                     logger.info("Adding is_default column to message_templates table")
                     connection.execute(text("""
@@ -76,12 +91,13 @@ class DatabaseService:
                         ADD COLUMN is_default BOOLEAN DEFAULT FALSE
                     """))
                     connection.commit()
-                    
+
                 logger.info("Database migration completed successfully")
-                
+
         except Exception as e:
+            # Em ambientes novos é esperado não existir a tabela ainda; mantém warning suave
             logger.warning(f"Migration warning (may be normal for new databases): {e}")
-    
+
     @contextmanager
     def get_session(self):
         """Get database session with automatic cleanup"""
@@ -94,8 +110,12 @@ class DatabaseService:
             logger.error(f"Database session error: {e}")
             raise
         finally:
+            # scoped_session fecha/retira a sessão do escopo (thread/request)
             session.close()
-    
+            self.SessionLocal.remove()
+
+    # --------- Templates default ---------
+
     def create_default_templates(self, user_id):
         """Create default message templates for a specific user"""
         default_templates = [
@@ -136,21 +156,21 @@ class DatabaseService:
                 'content': '✅ RENOVAÇÃO CONFIRMADA COM SUCESSO!\n\nOlá {nome}!\n\n🎊 Seu plano "{plano}" foi renovado com sucesso!\n\n📅 Novo vencimento: {vencimento}\n💰 Valor: R$ {valor}\n\nObrigado pela confiança! Continue aproveitando nossos serviços. 🌟'
             }
         ]
-        
+
         with self.get_session() as session:
             for template_data in default_templates:
                 existing = session.query(MessageTemplate).filter_by(
                     template_type=template_data['template_type'],
                     user_id=user_id
                 ).first()
-                
+
                 if not existing:
                     template_data['user_id'] = user_id
-                    template_data['is_default'] = True  # Mark as default template
+                    template_data['is_default'] = True
                     template = MessageTemplate(**template_data)
                     session.add(template)
                     logger.info(f"Created default template for user {user_id}: {template_data['name']}")
-    
+
     def restore_default_templates(self, user_id):
         """Restore all default templates to original state"""
         default_templates = [
@@ -191,30 +211,27 @@ class DatabaseService:
                 'content': '✅ RENOVAÇÃO CONFIRMADA COM SUCESSO!\n\nOlá {nome}!\n\n🎊 Seu plano "{plano}" foi renovado com sucesso!\n\n📅 Novo vencimento: {vencimento}\n💰 Valor: R$ {valor}\n\nObrigado pela confiança! Continue aproveitando nossos serviços. 🌟'
             }
         ]
-        
+
         with self.get_session() as session:
-            # Update existing default templates
             for template_data in default_templates:
                 existing = session.query(MessageTemplate).filter_by(
                     template_type=template_data['template_type'],
                     user_id=user_id,
                     is_default=True
                 ).first()
-                
+
                 if existing:
-                    # Update existing default template
                     existing.name = template_data['name']
                     existing.subject = template_data['subject']
                     existing.content = template_data['content']
                     existing.is_active = True
                     logger.info(f"Restored default template for user {user_id}: {template_data['name']}")
                 else:
-                    # Create new default template if missing
                     template_data['user_id'] = user_id
                     template_data['is_default'] = True
                     template = MessageTemplate(**template_data)
                     session.add(template)
                     logger.info(f"Created missing default template for user {user_id}: {template_data['name']}")
 
-# Global database service instance
+# Global database service instance (singleton)
 db_service = DatabaseService()
