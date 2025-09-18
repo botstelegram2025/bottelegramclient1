@@ -13,6 +13,17 @@ logger = logging.getLogger(__name__)
 # OBS: garanta que TODO o código importe "db_service" (singleton) e
 # NUNCA faça DatabaseService() em outros módulos.
 
+# Conjunto dos tipos CANÔNICOS do sistema (sem prefixo)
+CANONICAL_BUCKETS = {
+    "reminder_2_days",
+    "reminder_1_day",
+    "reminder_due_date",
+    "reminder_overdue",
+    "welcome",
+    "renewal",
+    "custom",
+}
+
 class DatabaseService:
     def __init__(self):
         db_url = Config.DATABASE_URL
@@ -47,7 +58,15 @@ class DatabaseService:
             raise
 
     def _migrate_existing_tables(self):
-        """Add new columns to existing tables if they don't exist"""
+        """
+        Add/ajusta colunas e constraints e normaliza tipos de templates:
+        - Garante clients.reminder_status e clients.last_reminder_sent
+        - Garante message_templates.is_default
+        - Cria UNIQUE (user_id, template_type)
+        - Converte templates de usuário que usam nomes CANÔNICOS para 'user_<canônico>'
+          sem tocar nos padrões (is_default = TRUE)
+        - Desativa duplicatas quando já existir a versão 'user_<...>' do mesmo usuário
+        """
         try:
             with self.engine.connect() as connection:
                 # clients.reminder_status
@@ -92,6 +111,78 @@ class DatabaseService:
                     """))
                     connection.commit()
 
+                # UNIQUE (user_id, template_type)
+                # cria somente se ainda não existir
+                result = connection.execute(text("""
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.constraint_column_usage ccu
+                      ON tc.constraint_name = ccu.constraint_name
+                    WHERE tc.table_name = 'message_templates'
+                      AND tc.constraint_type = 'UNIQUE'
+                      AND tc.constraint_name = 'uq_user_template_type'
+                """))
+                if not result.fetchone():
+                    logger.info("Adding unique constraint uq_user_template_type on message_templates(user_id, template_type)")
+                    try:
+                        connection.execute(text("""
+                            ALTER TABLE message_templates
+                            ADD CONSTRAINT uq_user_template_type UNIQUE (user_id, template_type)
+                        """))
+                        connection.commit()
+                    except Exception as e:
+                        # Em bancos antigos pode haver duplicatas; lidamos já abaixo na normalização
+                        logger.warning(f"Could not create unique constraint yet: {e}")
+
+                # ---------- Normalização: prefixa user_ quando necessário ----------
+                # 1) Desativar duplicatas que conflitam com a versão user_ já existente
+                canonical_list = tuple(CANONICAL_BUCKETS)
+                # somente buckets de lembrete que interessam para o agendador
+                canonical_reminders = ('reminder_2_days','reminder_1_day','reminder_due_date','reminder_overdue')
+
+                logger.info("Deactivating duplicate canonical user templates (if any)")
+                connection.execute(text(f"""
+                    UPDATE message_templates t
+                    SET is_active = FALSE
+                    FROM message_templates u
+                    WHERE t.user_id = u.user_id
+                      AND t.is_default = FALSE
+                      AND t.template_type IN {canonical_reminders}
+                      AND u.template_type = ('user_' || t.template_type)
+                """))
+                connection.commit()
+
+                # 2) Renomear as que restarem: canônicas de usuário -> user_<canônico>
+                logger.info("Renaming canonical user templates to user_ prefixed types")
+                connection.execute(text(f"""
+                    UPDATE message_templates
+                    SET template_type = ('user_' || template_type)
+                    WHERE is_default = FALSE
+                      AND template_type IN {canonical_reminders}
+                """))
+                connection.commit()
+
+                # 3) Tentar novamente criar a UNIQUE (caso tenha falhado antes por duplicatas)
+                result = connection.execute(text("""
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.constraint_column_usage ccu
+                      ON tc.constraint_name = ccu.constraint_name
+                    WHERE tc.table_name = 'message_templates'
+                      AND tc.constraint_type = 'UNIQUE'
+                      AND tc.constraint_name = 'uq_user_template_type'
+                """))
+                if not result.fetchone():
+                    try:
+                        connection.execute(text("""
+                            ALTER TABLE message_templates
+                            ADD CONSTRAINT uq_user_template_type UNIQUE (user_id, template_type)
+                        """))
+                        connection.commit()
+                        logger.info("Unique constraint uq_user_template_type created")
+                    except Exception as e:
+                        logger.warning(f"Unique constraint still not created: {e}")
+
                 logger.info("Database migration completed successfully")
 
         except Exception as e:
@@ -117,7 +208,7 @@ class DatabaseService:
     # --------- Templates default ---------
 
     def create_default_templates(self, user_id):
-        """Create default message templates for a specific user"""
+        """Create default message templates for a specific user (canônicas e is_default=True)"""
         default_templates = [
             {
                 'name': '📅 Lembrete 2 dias antes',
