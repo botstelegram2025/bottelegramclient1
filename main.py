@@ -5063,7 +5063,7 @@ async def create_template_final(update: Update, context: ContextTypes.DEFAULT_TY
                 user_id=db_user.id,
                 name=template_data['name'],
                 template_type=template_data['type'],
-                content=template_data['content'],f
+                content=template_data['content'],
                 is_active=True
             )
             
