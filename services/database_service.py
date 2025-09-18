@@ -32,19 +32,17 @@ class DatabaseService:
         self.engine = create_engine(
             db_url,
             poolclass=QueuePool,
-            pool_size=int(os.getenv("DB_POOL_SIZE", "5")),   # ajuste conforme seu plano
-            max_overflow=int(os.getenv("DB_POOL_MAX_OVERFLOW", "0")),  # não estourar
-            pool_pre_ping=True,          # valida conexão antes de usar
-            pool_recycle=1800,           # recicla a cada 30min
-            pool_use_lifo=True,          # reutiliza as conexões mais novas
+            pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+            max_overflow=int(os.getenv("DB_POOL_MAX_OVERFLOW", "0")),
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            pool_use_lifo=True,
             echo=False
         )
 
-        # Sessões que não expiram objetos após commit (evita re-loads desnecessários)
         self._SessionFactory = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.SessionLocal = scoped_session(self._SessionFactory)
 
-        # Criar/migrar tabelas (executa rápido e é idempotente)
         self.create_tables()
 
     def create_tables(self):
@@ -63,7 +61,7 @@ class DatabaseService:
         - Garante clients.reminder_status e clients.last_reminder_sent
         - Garante message_templates.is_default
         - Cria UNIQUE (user_id, template_type)
-        - Converte templates de usuário que usam nomes CANÔNICOS para 'user_<canônico>'
+        - Converte templates de usuário canônicos para 'user_<canônico>'
           sem tocar nos padrões (is_default = TRUE)
         - Desativa duplicatas quando já existir a versão 'user_<...>' do mesmo usuário
         """
@@ -112,7 +110,6 @@ class DatabaseService:
                     connection.commit()
 
                 # UNIQUE (user_id, template_type)
-                # cria somente se ainda não existir
                 result = connection.execute(text("""
                     SELECT 1
                     FROM information_schema.table_constraints tc
@@ -131,38 +128,36 @@ class DatabaseService:
                         """))
                         connection.commit()
                     except Exception as e:
-                        # Em bancos antigos pode haver duplicatas; lidamos já abaixo na normalização
                         logger.warning(f"Could not create unique constraint yet: {e}")
 
                 # ---------- Normalização: prefixa user_ quando necessário ----------
-                # 1) Desativar duplicatas que conflitam com a versão user_ já existente
-                canonical_list = tuple(CANONICAL_BUCKETS)
-                # somente buckets de lembrete que interessam para o agendador
-                canonical_reminders = ('reminder_2_days','reminder_1_day','reminder_due_date','reminder_overdue')
+                # buckets principais usados pelo agendador + RENEWAL
+                canonical_with_renewal = ('reminder_2_days','reminder_1_day','reminder_due_date','reminder_overdue','renewal')
 
-                logger.info("Deactivating duplicate canonical user templates (if any)")
+                # 1) Desativar duplicatas: se já existe user_<tipo>, desativa a versão canônica do usuário
+                logger.info("Deactivating duplicate canonical user templates (including renewal)")
                 connection.execute(text(f"""
                     UPDATE message_templates t
                     SET is_active = FALSE
                     FROM message_templates u
                     WHERE t.user_id = u.user_id
                       AND t.is_default = FALSE
-                      AND t.template_type IN {canonical_reminders}
+                      AND t.template_type IN {canonical_with_renewal}
                       AND u.template_type = ('user_' || t.template_type)
                 """))
                 connection.commit()
 
-                # 2) Renomear as que restarem: canônicas de usuário -> user_<canônico>
-                logger.info("Renaming canonical user templates to user_ prefixed types")
+                # 2) Renomear as que restarem: canônicas de usuário -> user_<canônico> (inclui renewal)
+                logger.info("Renaming canonical user templates to user_ prefixed types (including renewal)")
                 connection.execute(text(f"""
                     UPDATE message_templates
                     SET template_type = ('user_' || template_type)
                     WHERE is_default = FALSE
-                      AND template_type IN {canonical_reminders}
+                      AND template_type IN {canonical_with_renewal}
                 """))
                 connection.commit()
 
-                # 3) Tentar novamente criar a UNIQUE (caso tenha falhado antes por duplicatas)
+                # 3) Recria UNIQUE se tiver falhado antes
                 result = connection.execute(text("""
                     SELECT 1
                     FROM information_schema.table_constraints tc
@@ -186,7 +181,6 @@ class DatabaseService:
                 logger.info("Database migration completed successfully")
 
         except Exception as e:
-            # Em ambientes novos é esperado não existir a tabela ainda; mantém warning suave
             logger.warning(f"Migration warning (may be normal for new databases): {e}")
 
     @contextmanager
@@ -201,7 +195,6 @@ class DatabaseService:
             logger.error(f"Database session error: {e}")
             raise
         finally:
-            # scoped_session fecha/retira a sessão do escopo (thread/request)
             session.close()
             self.SessionLocal.remove()
 
