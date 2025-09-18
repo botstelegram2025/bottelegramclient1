@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 SAO_PAULO_TZ = pytz.timezone("America/Sao_Paulo")
 
+# NOVO: traga o singleton (não crie DatabaseService() neste módulo)
+from services.database_service import db_service
+
 class SchedulerService:
     def __init__(self):
         self.is_running = False
@@ -17,13 +20,39 @@ class SchedulerService:
         self.loop = None
         self._last_reset_date_sp = None
 
-        # ---- aliases de templates (flexível para seus nomes atuais) ----
-        # ordem importa: o primeiro encontrado ativo é usado
+        # ---- mapeamento canônico por bucket ----
+        # Usaremos estes nomes base para priorizar user_<canônico> e, se não existir, o canônico.
+        self.BUCKET_TO_CANON = {
+            "D_MINUS_2": "reminder_2_days",
+            "D_MINUS_1": "reminder_1_day",
+            "D_ZERO":    "reminder_due_date",
+            "OVERDUE":   "reminder_overdue",
+        }
+
+        # ---- aliases (para compatibilidade com bases antigas) ----
+        # Mantemos estes para caso ainda existam registros legados sem migração.
         self.TEMPLATE_ALIASES = {
-            "D_MINUS_2": ["reminder_2_days", "two_days_before", "vencimento_2_dias", "2_dias", "2dias_antes"],
-            "D_MINUS_1": ["reminder_1_day", "one_day_before", "vencimento_1_dia", "1_dia", "1dia_antes"],
-            "D_ZERO":    ["reminder_due_date", "vencimento_hoje", "vence_hoje", "hoje"],
-            "OVERDUE":   ["reminder_overdue", "vencido", "atraso", "em_atraso"],
+            "D_MINUS_2": [
+                "reminder_2_days", "user_reminder_2_days",
+                "reminder_2days",  "user_reminder_2days",
+                "two_days_before",
+                "vencimento_2_dias", "2_dias", "2dias_antes"
+            ],
+            "D_MINUS_1": [
+                "reminder_1_day", "user_reminder_1_day",
+                "reminder_1day",  "user_reminder_1day",
+                "one_day_before",
+                "vencimento_1_dia", "1_dia", "1dia_antes"
+            ],
+            "D_ZERO": [
+                "reminder_due_date", "user_reminder_due_date",
+                "reminder_due",      "user_reminder_due",
+                "vencimento_hoje", "vence_hoje", "hoje"
+            ],
+            "OVERDUE": [
+                "reminder_overdue", "user_reminder_overdue",
+                "vencido", "atraso", "em_atraso"
+            ],
         }
 
     # -------------------- Lifecycle --------------------
@@ -77,13 +106,11 @@ class SchedulerService:
             current_time_str = now_sp.strftime("%H:%M")
             logger.info(f"🔄 MIDNIGHT RESET @ {current_time_str} (SP)")
 
-            from services.database_service import DatabaseService
             from models import Client
 
-            db_service = DatabaseService()
             with db_service.get_session() as session:
                 yesterday_sp = (now_sp - timedelta(days=1)).date()
-                # compat: não interfere na lógica por log; apenas mantém campo legados
+                # compat: mantém campo legado, mas não interfere na lógica por log
                 session.query(Client).filter_by(status='active').update({
                     'last_reminder_sent': yesterday_sp
                 })
@@ -95,10 +122,8 @@ class SchedulerService:
 
     def _check_reminder_times(self):
         try:
-            from services.database_service import DatabaseService
             from models import User, UserScheduleSettings
 
-            db_service = DatabaseService()
             now_sp = datetime.now(SAO_PAULO_TZ)
             current_time_hhmm = now_sp.strftime("%H:%M")
             current_date_sp = now_sp.date()
@@ -194,10 +219,8 @@ class SchedulerService:
     def _check_due_dates(self):
         logger.info("Running due date info pass")
         try:
-            from services.database_service import DatabaseService
             from models import Client
 
-            db_service = DatabaseService()
             with db_service.get_session() as session:
                 today_sp = datetime.now(SAO_PAULO_TZ).date()
                 try:
@@ -220,12 +243,9 @@ class SchedulerService:
     def _check_pending_payments(self):
         logger.info("🔍 Checking pending payments for automatic processing")
         try:
-            from services.database_service import DatabaseService
             from services.payment_service import payment_service
             from services.telegram_service import telegram_service
             from models import User, Subscription
-
-            db_service = DatabaseService()
 
             with db_service.get_session() as session:
                 yesterday_utc = datetime.utcnow() - timedelta(hours=24)
@@ -319,11 +339,8 @@ class SchedulerService:
                 self.loop.close()
 
     async def _process_user_notifications(self):
-        from services.database_service import DatabaseService
         from services.telegram_service import telegram_service
         from models import Client, User
-
-        db_service = DatabaseService()
 
         today = datetime.now(SAO_PAULO_TZ).date()
         tomorrow = today + timedelta(days=1)
@@ -407,21 +424,48 @@ class SchedulerService:
             return "OVERDUE"
         return None
 
-    def _get_active_template(self, session, user_id, alias_keys):
-        """Busca o primeiro template ativo que exista para a lista de aliases indicada."""
+    def _get_active_template_for_bucket(self, session, user_id: int, key: str):
+        """
+        Prioridade:
+          1) user_<canônico> ativo do usuário
+          2) canônico ativo (padrão do sistema)
+          3) aliases (legado) ativos do usuário
+        """
         from models import MessageTemplate
-        for key in alias_keys:
-            names = self.TEMPLATE_ALIASES.get(key, [])
-            if not names:
-                continue
-            # procura por qualquer um dos nomes
-            template = session.query(MessageTemplate).filter(
+
+        canonical = self.BUCKET_TO_CANON.get(key)
+        if not canonical:
+            return None
+
+        # 1) user_<canônico> do usuário
+        t_user = session.query(MessageTemplate).filter(
+            MessageTemplate.user_id == user_id,
+            MessageTemplate.is_active == True,
+            MessageTemplate.template_type == f"user_{canonical}"
+        ).first()
+        if t_user:
+            return t_user
+
+        # 2) canônico (padrão). Dependendo do seu modelo, o padrão pode ter user_id == user_id e is_default=True
+        # ou user_id == NULL. Aqui buscamos por tipo + ativo, sem exigir user_id específico.
+        t_sys = session.query(MessageTemplate).filter(
+            MessageTemplate.is_active == True,
+            MessageTemplate.template_type == canonical
+        ).order_by(MessageTemplate.is_default.desc()).first()
+        if t_sys:
+            return t_sys
+
+        # 3) aliases legados do usuário (caso exista base antiga)
+        alias_list = self.TEMPLATE_ALIASES.get(key, [])
+        if alias_list:
+            t_legacy = session.query(MessageTemplate).filter(
                 MessageTemplate.user_id == user_id,
                 MessageTemplate.is_active == True,
-                MessageTemplate.template_type.in_(names)
+                MessageTemplate.template_type.in_(alias_list)
             ).order_by(MessageTemplate.id.asc()).first()
-            if template:
-                return template
+            if t_legacy:
+                return t_legacy
+
         return None
 
     def _already_sent_today(self, session, user_id, client_id, template_type) -> bool:
@@ -439,19 +483,17 @@ class SchedulerService:
         """
         Envia 1 template por cliente/dia, conforme o delta:
         D-2, D-1, D0 e D+N (overdue) diariamente até renovar (mudar due_date).
-        Usa aliases de template para suportar nomes diferentes.
+        Prioriza user_<bucket>, cai no canônico se não houver e aceita aliases legados.
         """
         logger.info(f"🚀 SYNC DAILY ENGINE: user {user_id}")
         try:
-            from services.database_service import DatabaseService
             from services.whatsapp_service import WhatsAppService
             from models import Client, MessageLog
 
-            db = DatabaseService()
             ws = WhatsAppService()
             today_sp = datetime.now(SAO_PAULO_TZ).date()
 
-            with db.get_session() as session:
+            with db_service.get_session() as session:
                 clients = session.query(Client).filter(
                     Client.user_id == user_id,
                     Client.auto_reminders_enabled == True
@@ -486,13 +528,13 @@ class SchedulerService:
                     elif key == "OVERDUE":
                         bucket_counts["OVERDUE"] += 1
 
-                    # pega primeiro template ativo dentre os aliases dessa chave
-                    template = self._get_active_template(session, user_id, [key])
+                    # pega template ativo, priorizando user_<canônico>
+                    template = self._get_active_template_for_bucket(session, user_id, key)
                     if not template:
                         no_template += 1
                         continue
 
-                    # de-dup por dia
+                    # de-dup por dia (por tipo efetivamente usado)
                     if self._already_sent_today(session, user_id, client.id, template.template_type):
                         dedup += 1
                         continue
@@ -510,7 +552,7 @@ class SchedulerService:
                     log = MessageLog(
                         user_id=user_id,
                         client_id=client.id,
-                        template_type=template.template_type,  # guarda o nome real do template usado
+                        template_type=template.template_type,  # preserva tipo real (user_... ou canônico)
                         recipient_phone=client.phone_number,
                         message_content=msg,
                         sent_at=datetime.now(),
