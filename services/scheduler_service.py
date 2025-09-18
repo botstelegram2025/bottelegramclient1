@@ -428,7 +428,7 @@ class SchedulerService:
         """
         Prioridade:
           1) user_<canônico> ativo do usuário
-          2) canônico ativo (padrão do sistema)
+          2) canônico default ativo DO MESMO USUÁRIO (is_default=True)
           3) aliases (legado) ativos do usuário
         """
         from models import MessageTemplate
@@ -446,12 +446,13 @@ class SchedulerService:
         if t_user:
             return t_user
 
-        # 2) canônico (padrão). Dependendo do seu modelo, o padrão pode ter user_id == user_id e is_default=True
-        # ou user_id == NULL. Aqui buscamos por tipo + ativo, sem exigir user_id específico.
+        # 2) canônico default ativo DO MESMO USUÁRIO
         t_sys = session.query(MessageTemplate).filter(
+            MessageTemplate.user_id == user_id,
             MessageTemplate.is_active == True,
-            MessageTemplate.template_type == canonical
-        ).order_by(MessageTemplate.is_default.desc()).first()
+            MessageTemplate.template_type == canonical,
+            MessageTemplate.is_default == True
+        ).first()
         if t_sys:
             return t_sys
 
@@ -483,7 +484,8 @@ class SchedulerService:
         """
         Envia 1 template por cliente/dia, conforme o delta:
         D-2, D-1, D0 e D+N (overdue) diariamente até renovar (mudar due_date).
-        Prioriza user_<bucket>, cai no canônico se não houver e aceita aliases legados.
+        Prioriza user_<bucket>, cai no canônico default do usuário se não houver
+        e aceita aliases legados.
         """
         logger.info(f"🚀 SYNC DAILY ENGINE: user {user_id}")
         try:
@@ -528,7 +530,7 @@ class SchedulerService:
                     elif key == "OVERDUE":
                         bucket_counts["OVERDUE"] += 1
 
-                    # pega template ativo, priorizando user_<canônico>
+                    # pega template ativo, priorizando user_<canônico>, depois canônico default do mesmo usuário
                     template = self._get_active_template_for_bucket(session, user_id, key)
                     if not template:
                         no_template += 1
