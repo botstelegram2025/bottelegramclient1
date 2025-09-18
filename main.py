@@ -2946,7 +2946,7 @@ Renove agora para manter o serviço ativo! ⏰"""
 
 Renove urgentemente para reativar! 🔄"""
         },
-        'renewal': {
+        'user_renewal': {
             'name': 'Renovação realizada',
             'content': """✅ Renovação Confirmada - {nome}
 
@@ -3259,7 +3259,7 @@ async def send_renewal_message_callback(update: Update, context: ContextTypes.DE
             client = session.query(Client).filter_by(id=client_id, user_id=db_user.id).first()
             template = session.query(MessageTemplate).filter_by(
                 user_id=db_user.id, 
-                template_type='renewal',
+                template_type='user_renewal',
                 is_active=True
             ).first()
             
@@ -5063,7 +5063,7 @@ async def create_template_final(update: Update, context: ContextTypes.DEFAULT_TY
                 user_id=db_user.id,
                 name=template_data['name'],
                 template_type=template_data['type'],
-                content=template_data['content'],
+                content=template_data['content'],f
                 is_active=True
             )
             
