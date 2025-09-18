@@ -4965,13 +4965,13 @@ async def show_template_type_selection(update: Update, template_name: str):
 🏷️ Selecione o tipo do template:"""
     
     keyboard = [
-        [InlineKeyboardButton("🎉 Boas-vindas", callback_data="template_type_welcome")],
-        [InlineKeyboardButton("📅 Lembrete 2 dias antes", callback_data="template_type_reminder_2_days")],
-        [InlineKeyboardButton("⏰ Lembrete 1 dia antes", callback_data="template_type_reminder_1_day")],
-        [InlineKeyboardButton("🚨 Lembrete no vencimento", callback_data="template_type_reminder_due_date")],
-        [InlineKeyboardButton("❌ Lembrete após vencimento", callback_data="template_type_reminder_overdue")],
-        [InlineKeyboardButton("✅ Renovação confirmada", callback_data="template_type_renewal")],
-        [InlineKeyboardButton("🔧 Personalizado", callback_data="template_type_custom")],
+        [InlineKeyboardButton("🎉 Boas-vindas", callback_data="template_type_user_welcome")],
+        [InlineKeyboardButton("📅 Lembrete 2 dias antes", callback_data="template_type_user_reminder_2_days")],
+        [InlineKeyboardButton("⏰ Lembrete 1 dia antes", callback_data="template_type_user_reminder_1_day")],
+        [InlineKeyboardButton("🚨 Lembrete no vencimento", callback_data="template_type_user_reminder_due_date")],
+        [InlineKeyboardButton("❌ Lembrete após vencimento", callback_data="template_type_user_reminder_overdue")],
+        [InlineKeyboardButton("✅ Renovação confirmada", callback_data="template_type_user_renewal")],
+        [InlineKeyboardButton("🔧 Personalizado", callback_data="template_type_user_custom")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="template_type_cancel")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -5018,13 +5018,13 @@ async def template_type_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def show_template_content_input(query, template_name: str, template_type: str):
     """Show template content input - Step 3"""
     type_names = {
-        'welcome': 'Boas-vindas',
-        'reminder_2_days': 'Lembrete 2 dias antes',
-        'reminder_1_day': 'Lembrete 1 dia antes',
-        'reminder_due_date': 'Lembrete no vencimento',
-        'reminder_overdue': 'Lembrete após vencimento',
-        'renewal': 'Renovação confirmada',
-        'custom': 'Personalizado'
+        'user_welcome': 'Boas-vindas',
+        'user_reminder_2_days': 'Lembrete 2 dias antes',
+        'user_reminder_1_day': 'Lembrete 1 dia antes',
+        'user_reminder_due_date': 'Lembrete no vencimento',
+        'user_reminder_overdue': 'Lembrete após vencimento',
+        'user_renewal': 'Renovação confirmada',
+        'user_custom': 'Personalizado'
     }
     
     text = f"""➕ CRIAR NOVO TEMPLATE - Etapa 3/3
